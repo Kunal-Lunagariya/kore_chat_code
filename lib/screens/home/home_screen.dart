@@ -110,32 +110,36 @@ class RecentChat {
       if (fileType == 'audio') return 'Audio';
       return 'File';
     }
-    return lastMessageText.isNotEmpty ? lastMessageText : '...';
+    return lastMessageId != null ? lastMessageText : 'No messages yet';
   }
 
+  // ── FIX: Use UTC directly — no toLocal() ──
   String get formattedTime {
     if (lastMessageTime == null) return '';
-    final now = DateTime.now();
-    final msg = lastMessageTime!.toLocal();
-    final diff = now.difference(msg);
-    if (diff.inDays == 0) {
-      final h = msg.hour;
-      final m = msg.minute.toString().padLeft(2, '0');
+    final nowUtc = DateTime.now().toUtc();
+    final msgUtc = lastMessageTime!; // already parsed as UTC from ISO string
+    final diffDays = DateTime.utc(nowUtc.year, nowUtc.month, nowUtc.day)
+        .difference(DateTime.utc(msgUtc.year, msgUtc.month, msgUtc.day))
+        .inDays;
+
+    if (diffDays == 0) {
+      final h = msgUtc.hour;
+      final m = msgUtc.minute.toString().padLeft(2, '0');
       final period = h >= 12 ? 'pm' : 'am';
       final hour = h > 12 ? h - 12 : (h == 0 ? 12 : h);
       return '$hour:$m $period';
-    } else if (diff.inDays == 1) {
+    } else if (diffDays == 1) {
       return 'Yesterday';
-    } else if (diff.inDays < 7) {
+    } else if (diffDays < 7) {
       const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      return days[msg.weekday - 1];
+      return days[msgUtc.weekday - 1];
     }
-    return '${msg.day}/${msg.month}/${msg.year.toString().substring(2)}';
+    return '${msgUtc.day}/${msgUtc.month}/${msgUtc.year.toString().substring(2)}';
   }
 }
 
 // ─────────────────────────────────────────────
-// Shared helper
+// Shared helpers
 // ─────────────────────────────────────────────
 
 String _initials(String name) {
@@ -183,7 +187,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _fetchRecentChats();
-    // Auto-refresh every 30 seconds
     _refreshTimer = Timer.periodic(
       const Duration(seconds: 30),
           (_) => _fetchRecentChats(silent: true),
@@ -192,7 +195,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Refresh when app comes back to foreground
     if (state == AppLifecycleState.resumed) {
       _fetchRecentChats(silent: true);
     }
@@ -258,9 +260,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => _NewChatModal(currentUserId: widget.userId),
+      builder: (_) => _NewChatModal(
+        currentUserId: widget.userId,
+        myUserId: widget.userId,
+        onChatOpened: (conversationId, themUserId, themUserName, themIsOnline) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ChatScreen(
+                conversationId: conversationId,
+                themUserId: themUserId,
+                themUserName: themUserName,
+                themIsOnline: themIsOnline,
+                myUserId: widget.userId,
+              ),
+            ),
+          ).then((_) => _fetchRecentChats(silent: true));
+        },
+      ),
     );
-    // Refresh after closing — user may have started a new chat
     _fetchRecentChats(silent: true);
   }
 
@@ -328,8 +346,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ),
-              _iconBtn(Icons.notifications_off_outlined, isDark, () {}),
-              const SizedBox(width: 4),
               _iconBtn(Icons.logout_rounded, isDark, () => _showLogoutDialog(isDark)),
             ],
           ),
@@ -419,7 +435,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: Container(
               width: 44, height: 44,
               decoration: BoxDecoration(
-                gradient: const LinearGradient(colors: [AppTheme.redAccent, AppTheme.redDark], begin: Alignment.topLeft, end: Alignment.bottomRight),
+                gradient: const LinearGradient(
+                    colors: [AppTheme.redAccent, AppTheme.redDark],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight),
                 borderRadius: BorderRadius.circular(14),
                 boxShadow: [BoxShadow(color: AppTheme.redAccent.withOpacity(0.35), blurRadius: 10, offset: const Offset(0, 4))],
               ),
@@ -444,17 +463,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     : AppTheme.lightTextSecondary.withOpacity(0.6),
                 fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 1.2,
               )),
-          const SizedBox(width: 8),
-          if (!_isLoading && _filteredChats.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-              decoration: BoxDecoration(
-                color: AppTheme.redAccent.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text('${_filteredChats.length}',
-                  style: const TextStyle(color: AppTheme.redAccent, fontSize: 10, fontWeight: FontWeight.w700)),
-            ),
           const Spacer(),
           GestureDetector(
             onTap: _fetchRecentChats,
@@ -540,7 +548,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       onRefresh: _fetchRecentChats,
       child: ListView.builder(
         physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         itemCount: _filteredChats.length,
         itemBuilder: (_, i) => _buildChatTile(_filteredChats[i], isDark),
       ),
@@ -550,11 +558,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _buildChatTile(RecentChat chat, bool isDark) {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
-      decoration: BoxDecoration(
-        color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder, width: 1),
-      ),
       child: Material(
         color: Colors.transparent,
         borderRadius: BorderRadius.circular(16),
@@ -573,14 +576,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ),
               ),
             );
-            // Refresh list when coming back (unread count may have changed)
             _fetchRecentChats(silent: true);
           },
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
             child: Row(
               children: [
-                // Avatar + online dot
                 Stack(
                   children: [
                     Container(
@@ -606,8 +607,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
                 const SizedBox(width: 12),
-
-                // Name + preview
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -649,8 +648,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                 ),
                 const SizedBox(width: 8),
-
-                // Time + unread badge
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
@@ -726,7 +723,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
 class _NewChatModal extends StatefulWidget {
   final int currentUserId;
-  const _NewChatModal({required this.currentUserId});
+  final int myUserId;
+  final void Function(int conversationId, int themUserId, String themUserName, bool themIsOnline) onChatOpened;
+
+  const _NewChatModal({
+    required this.currentUserId,
+    required this.myUserId,
+    required this.onChatOpened,
+  });
 
   @override
   State<_NewChatModal> createState() => _NewChatModalState();
@@ -737,6 +741,7 @@ class _NewChatModalState extends State<_NewChatModal> {
   List<ChatUser> _allUsers = [];
   List<ChatUser> _filtered = [];
   bool _loading = true;
+  bool _starting = false; // loading state for API call
 
   @override
   void initState() {
@@ -769,6 +774,123 @@ class _NewChatModalState extends State<_NewChatModal> {
           ? _allUsers
           : _allUsers.where((u) => u.label.toLowerCase().contains(query.toLowerCase())).toList();
     });
+  }
+
+  // Show confirm dialog then call POST v1/chat/private
+  void _onUserTap(ChatUser user) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        icon: Container(
+          width: 56, height: 56,
+          decoration: BoxDecoration(
+            color: isDark ? AppTheme.darkInput : AppTheme.lightInput,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(Icons.chat_bubble_outline_rounded,
+              size: 28,
+              color: isDark ? AppTheme.darkTextSecondary : AppTheme.lightTextSecondary),
+        ),
+        title: Text('Start Conversation',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary,
+              fontWeight: FontWeight.w700, fontSize: 18,
+            )),
+        content: Text(
+          'Start a conversation with ${user.label}?',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: isDark ? AppTheme.darkTextSecondary : AppTheme.lightTextSecondary,
+            fontSize: 14,
+          ),
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                child: TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  style: TextButton.styleFrom(
+                    backgroundColor: AppTheme.redAccent,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  child: const Text('Cancel',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: TextButton(
+                  onPressed: _starting ? null : () => _startChat(ctx, user),
+                  style: TextButton.styleFrom(
+                    backgroundColor: const Color(0xFF2196F3),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  child: _starting
+                      ? const SizedBox(width: 18, height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                      : const Text('Yes',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startChat(BuildContext dialogCtx, ChatUser user) async {
+    setState(() => _starting = true);
+    try {
+      final response = await ApiCall.post('v1/chat/private', data: {'toUserId': user.value});
+
+      if (!mounted) return;
+
+      if (response['success'] == true) {
+        final data = response['data'] as Map<String, dynamic>;
+        final conversationId = (data['conversationId'] as num?)?.toInt() ?? 0;
+        final themUserName = (data['themUserName'] as String?) ?? user.label;
+
+        // Close dialog
+        Navigator.pop(dialogCtx);
+        // Close modal
+        Navigator.pop(context);
+
+        // Navigate to chat screen
+        widget.onChatOpened(conversationId, user.value, themUserName, false);
+      } else {
+        Navigator.pop(dialogCtx);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(response['message'] as String? ?? 'Failed to start chat'),
+            backgroundColor: AppTheme.redAccent,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ));
+        }
+      }
+    } catch (_) {
+      if (mounted) {
+        Navigator.pop(dialogCtx);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: const Text('Failed to start chat'),
+          backgroundColor: AppTheme.redAccent,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _starting = false);
+    }
   }
 
   @override
@@ -896,10 +1018,7 @@ class _NewChatModalState extends State<_NewChatModal> {
       color: Colors.transparent,
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: () {
-          Navigator.pop(context);
-          // TODO: Open/create chat with this user
-        },
+        onTap: () => _onUserTap(user),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
           child: Row(

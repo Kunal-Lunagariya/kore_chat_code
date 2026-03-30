@@ -8,7 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 
 class ApiCall {
-  static const String baseUrl = 'http://182.16.16.181:9090/api/';
+  static const String baseUrl = 'https://chatapi.koremobiles.in/api/';
 
   static const String appName = 'Kore Chat';
 

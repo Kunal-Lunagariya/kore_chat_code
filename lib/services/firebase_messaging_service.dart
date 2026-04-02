@@ -15,7 +15,6 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     final callerName = data['callerName'] ?? 'Unknown';
     final callType = data['callType'] ?? 'audio';
     final callerId = data['callerId'] ?? '0';
-    // Offer comes as JSON string in FCM payload
     final offerJson = data['offerJson'] ?? data['offer'] ?? '';
 
     final params = CallKitParams(
@@ -30,7 +29,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
         'callerId': callerId,
         'callerName': callerName,
         'callType': callType,
-        'offerJson': offerJson, // ← passed through so accept can use it
+        'offerJson': offerJson,
       },
       android: AndroidParams(
         isCustomNotification: true,
@@ -49,7 +48,7 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
         supportsVideo: callType == 'video',
         maximumCallGroups: 1,
         maximumCallsPerCallGroup: 1,
-        audioSessionMode: 'default',
+        audioSessionMode: 'voiceChat',
         audioSessionActive: true,
         audioSessionPreferredSampleRate: 44100.0,
         audioSessionPreferredIOBufferDuration: 0.005,
@@ -63,14 +62,21 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 
     await FlutterCallkitIncoming.showCallkitIncoming(params);
   } else {
+    // Android only — iOS shows natively via Firebase
+    if (message.notification != null) return;
+
     final plugin = FlutterLocalNotificationsPlugin();
-    const androidSettings =
-    AndroidInitializationSettings('@mipmap/ic_launcher');
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
     await plugin.initialize(
-        const InitializationSettings(android: androidSettings));
+      const InitializationSettings(android: androidSettings),
+    );
 
-    final androidImpl = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-
+    final androidImpl = plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
     await androidImpl?.createNotificationChannel(
       const AndroidNotificationChannel(
         'kore_messages',
@@ -84,12 +90,10 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 
     final senderName = data['senderName'] ?? 'New Message';
     final messageText = data['message'] ?? '';
-    final conversationId =
-        int.tryParse(data['conversationId'] ?? '0') ?? 0;
+    final conversationId = int.tryParse(data['conversationId'] ?? '0') ?? 0;
     final isGroup = data['isGroup'] == 'true';
     final groupName = data['groupName'] as String?;
-    final title =
-    isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
+    final title = isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
 
     await plugin.show(
       conversationId,

@@ -1,6 +1,8 @@
 import Flutter
 import UIKit
 import PushKit
+import AVFoundation
+import FirebaseMessaging
 import flutter_callkit_incoming
 
 @main
@@ -12,7 +14,10 @@ import flutter_callkit_incoming
     ) -> Bool {
         GeneratedPluginRegistrant.register(with: self)
 
-        // Register for VoIP push notifications via PushKit
+        // Register for APNs
+        application.registerForRemoteNotifications()
+
+        // Register for VoIP push via PushKit
         let voipRegistry = PKPushRegistry(queue: DispatchQueue.main)
         voipRegistry.delegate = self
         voipRegistry.desiredPushTypes = [PKPushType.voIP]
@@ -20,23 +25,43 @@ import flutter_callkit_incoming
         return super.application(application, didFinishLaunchingWithOptions: launchOptions)
     }
 
-    // ── PushKit delegate ─────────────────────────────────────────
+    // ── APNs token — pass to Firebase manually ────────────────────
+
+    override func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Foundation.Data
+    ) {
+        Messaging.messaging().apnsToken = deviceToken
+        print("✅ APNs token set")
+        super.application(
+            application,
+            didRegisterForRemoteNotificationsWithDeviceToken: deviceToken
+        )
+    }
+
+    override func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        print("⚠️ APNs registration failed: \(error)")
+    }
+
+    // ── PushKit: VoIP token ───────────────────────────────────────
 
     func pushRegistry(
         _ registry: PKPushRegistry,
         didUpdate pushCredentials: PKPushCredentials,
         for type: PKPushType
     ) {
-        // Convert VoIP token to hex string and send to your backend
-        let deviceToken = pushCredentials.token
+        let token = pushCredentials.token
             .map { String(format: "%02x", $0) }
             .joined()
-        print("📱 VoIP Push Token: \(deviceToken)")
-
-        // Pass to flutter_callkit_incoming
+        print("📱 VoIP token: \(token)")
         SwiftFlutterCallkitIncomingPlugin.sharedInstance?
-            .setDevicePushTokenVoIP(deviceToken)
+            .setDevicePushTokenVoIP(token)
     }
+
+    // ── PushKit: incoming VoIP call ───────────────────────────────
 
     func pushRegistry(
         _ registry: PKPushRegistry,
@@ -44,56 +69,75 @@ import flutter_callkit_incoming
         for type: PKPushType,
         completion: @escaping () -> Void
     ) {
-        // Called when a VoIP push arrives — even when app is killed
-        let data = payload.dictionaryPayload
+        let p = payload.dictionaryPayload
 
-        guard let callerName = data["callerName"] as? String,
-              let callType   = data["callType"]   as? String,
-              let callerIdStr = data["callerId"] as? String else {
+        guard
+            let callerName  = p["callerName"]  as? String,
+            let callType    = p["callType"]    as? String,
+            let callerIdStr = p["callerId"]    as? String
+        else {
             completion()
             return
         }
 
-        // Show native iOS CallKit UI immediately
-        SwiftFlutterCallkitIncomingPlugin.sharedInstance?.showCallkitIncoming(
-            flutter_callkit_incoming.CallKitParams(
-                id:          UUID().uuidString,
-                nameCaller:  callerName,
-                appName:     "Kore Circle",
-                type:        callType == "video" ? 1 : 0,
-                duration:    45000,
-                textAccept:  "Accept",
-                textDecline: "Decline",
-                extra: [
-                    "callerId": callerIdStr,
-                    "callType": callType,
-                ],
-                ios: flutter_callkit_incoming.IOSParams(
-                    iconName:           "AppIcon",
-                    handleType:         "generic",
-                    supportsVideo:      callType == "video",
-                    maximumCallGroups:  1,
-                    maximumCallsPerCallGroup: 1,
-                    audioSessionMode:   "default",
-                    audioSessionActive: true,
-                    audioSessionPreferredSampleRate: 44100.0,
-                    audioSessionPreferredIOBufferDuration: 0.005,
-                    supportsDTMF:       false,
-                    supportsHolding:    false,
-                    supportsGrouping:   false,
-                    supportsUngrouping: false,
-                    ringtonePath:       "system_ringtone_default"
-                )
-            ),
-            fromPushKit: true
+        let offerJson = p["offerJson"] as? String ?? ""
+        let uuid      = UUID().uuidString
+        let isVideo   = callType == "video"
+
+        // Activate audio before showing CallKit
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(
+                .playAndRecord,
+                mode: .voiceChat,
+                options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+            )
+            try session.setActive(true)
+        } catch {
+            print("⚠️ Audio error: \(error)")
+        }
+
+        let callData = flutter_callkit_incoming.Data(
+            id:         uuid,
+            nameCaller: callerName,
+            handle:     callerName,
+            type:       isVideo ? 1 : 0
         )
+        callData.appName  = "Kore Circle"
+        callData.duration = 45000
+        callData.extra    = [
+            "callerId":   callerIdStr,
+            "callerName": callerName,
+            "callType":   callType,
+            "offerJson":  offerJson,
+        ]
+        callData.iconName                              = "AppIcon"
+        callData.handleType                            = "generic"
+        callData.supportsVideo                         = isVideo
+        callData.maximumCallGroups                     = 1
+        callData.maximumCallsPerCallGroup              = 1
+        callData.audioSessionMode                      = "voiceChat"
+        callData.audioSessionActive                    = true
+        callData.audioSessionPreferredSampleRate       = 44100.0
+        callData.audioSessionPreferredIOBufferDuration = 0.005
+        callData.supportsDTMF                          = false
+        callData.supportsHolding                       = false
+        callData.supportsGrouping                      = false
+        callData.supportsUngrouping                    = false
+        callData.ringtonePath                          = "system_ringtone_default"
+
+        SwiftFlutterCallkitIncomingPlugin.sharedInstance?
+            .showCallkitIncoming(callData, fromPushKit: true)
+
         completion()
     }
+
+    // ── PushKit: token invalidated ────────────────────────────────
 
     func pushRegistry(
         _ registry: PKPushRegistry,
         didInvalidatePushTokenFor type: PKPushType
     ) {
-        print("⚠️ VoIP Push Token invalidated")
+        print("⚠️ VoIP token invalidated")
     }
 }

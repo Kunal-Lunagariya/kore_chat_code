@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -176,16 +177,30 @@ class _CallScreenState extends State<CallScreen>
   // ── WebRTC ──────────────────────────────────────────────────────
 
   Future<MediaStream> _getMedia() async {
+
+
     final constraints = _isVideo
         ? {
-      'audio': true,
+      'audio': {
+        'echoCancellation': true,
+        'noiseSuppression': true,
+        'autoGainControl': true,
+      },
       'video': {
         'facingMode': 'user',
         'width': {'ideal': 1280},
         'height': {'ideal': 720},
       },
     }
-        : {'audio': true, 'video': false};
+        : {
+      'audio': {
+        'echoCancellation': true,
+        'noiseSuppression': true,
+        'autoGainControl': true,
+      },
+      'video': false,
+    };
+
     return navigator.mediaDevices.getUserMedia(constraints);
   }
 
@@ -246,6 +261,7 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Future<void> _answerCall() async {
+
     NotificationService().endCall();
     if (widget.incomingOffer == null) return;
     try {
@@ -268,6 +284,7 @@ class _CallScreenState extends State<CallScreen>
         answer: {'type': answer.type, 'sdp': answer.sdp},
         callType: widget.callType,
       );
+
       _startTimer();
       if (mounted) setState(() => _callState = CallState.active);
     } catch (e) {
@@ -278,6 +295,7 @@ class _CallScreenState extends State<CallScreen>
 
   Future<void> _applyAnswer(Map<String, dynamic> answerMap) async {
     if (_pc == null) return;
+
     try {
       await _pc!.setRemoteDescription(RTCSessionDescription(
         answerMap['sdp'] as String,
@@ -799,7 +817,8 @@ class _CallScreenState extends State<CallScreen>
                           color: Colors.white38, size: 24),
                     ),
                   )
-                      : RTCVideoView(
+                      :
+                  RTCVideoView(
                     _localRenderer,
                     mirror: _isFrontCamera,
                     objectFit: RTCVideoViewObjectFit
@@ -821,9 +840,11 @@ class _CallScreenState extends State<CallScreen>
               top: false,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
-                child: isActive
+                child:
+                isActive
                     ? _buildVideoActiveControls()
-                    : isIncoming
+                    :
+                isIncoming
                     ? _buildIncomingControls()
                     : _buildCallingControls(),
               ),
@@ -873,12 +894,12 @@ class _CallScreenState extends State<CallScreen>
                 active: _isSpeakerOn,
                 onTap: _toggleSpeaker,
               ),
+              Center(child: _EndBtn(onTap: _hangup)),
+
             ],
           ),
         ),
-        const SizedBox(height: 16),
         // End call button
-        Center(child: _EndBtn(onTap: _hangup)),
       ],
     );
   }
@@ -1140,7 +1161,7 @@ class _EndBtn extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 68, height: 68,
+            width: 52, height: 52,
             decoration: const BoxDecoration(
               color: Color(0xFFE53935),
               shape: BoxShape.circle,

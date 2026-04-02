@@ -50,21 +50,28 @@ class _IncomingCallOverlayState extends State<IncomingCallOverlay>
   @override
   void dispose() {
     _ctrl.dispose();
+    NotificationService().stopForegroundRinging();
+
     super.dispose();
   }
 
   Future<void> _dismiss() async {
     await _ctrl.reverse();
+
     widget.onDismiss();
   }
 
   void _decline() {
     NotificationService().endCall();
+    NotificationService().stopForegroundRinging();
+
     _dismiss();
   }
 
   void _accept() {
     NotificationService().endCall();
+    NotificationService().stopForegroundRinging();
+
     _dismiss();
     Navigator.push(
       context,
@@ -82,8 +89,7 @@ class _IncomingCallOverlayState extends State<IncomingCallOverlay>
   }
 
   String _initials(String name) {
-    final parts =
-    name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
     if (parts.length >= 2) return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
     if (parts.length == 1) return parts[0][0].toUpperCase();
     return '?';
@@ -91,9 +97,14 @@ class _IncomingCallOverlayState extends State<IncomingCallOverlay>
 
   Color _avatarColor(String name) {
     const colors = [
-      Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFEF5350),
-      Color(0xFFAB47BC), Color(0xFF42A5F5), Color(0xFFFF7043),
-      Color(0xFF66BB6A), Color(0xFFEC407A),
+      Color(0xFF5C6BC0),
+      Color(0xFF26A69A),
+      Color(0xFFEF5350),
+      Color(0xFFAB47BC),
+      Color(0xFF42A5F5),
+      Color(0xFFFF7043),
+      Color(0xFF66BB6A),
+      Color(0xFFEC407A),
     ];
     return colors[name.length % colors.length];
   }
@@ -191,8 +202,7 @@ class _IncomingCallOverlayState extends State<IncomingCallOverlay>
                                       Text(
                                         'Incoming ${widget.callType == 'video' ? 'video' : 'audio'} call',
                                         style: TextStyle(
-                                          color:
-                                          Colors.white.withOpacity(0.55),
+                                          color: Colors.white.withOpacity(0.55),
                                           fontSize: 12,
                                           fontWeight: FontWeight.w500,
                                         ),
@@ -265,12 +275,14 @@ class _PulsingAvatarState extends State<_PulsingAvatar>
       duration: const Duration(milliseconds: 1400),
     )..repeat();
 
-    _scale = Tween(begin: 1.0, end: 1.5).animate(
-      CurvedAnimation(parent: _ctrl, curve: Curves.easeOut),
-    );
-    _opacity = Tween(begin: 0.5, end: 0.0).animate(
-      CurvedAnimation(parent: _ctrl, curve: Curves.easeOut),
-    );
+    _scale = Tween(
+      begin: 1.0,
+      end: 1.5,
+    ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
+    _opacity = Tween(
+      begin: 0.5,
+      end: 0.0,
+    ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
   }
 
   @override

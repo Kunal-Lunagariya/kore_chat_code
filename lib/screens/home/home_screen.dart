@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -223,12 +224,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   OverlayEntry? _callOverlayEntry;
 
+  StreamSubscription? _fcmCallSubscription;
+
+
   void _showIncomingCallBanner({
     required int fromUserId,
     required String fromUserName,
     required String callType,
     required Map<String, dynamic> offer,
   }) {
+    debugPrint('🎯 _showIncomingCallBanner called');
+    debugPrint('🎯 context mounted: $mounted');
+
     _callOverlayEntry?.remove();
     _callOverlayEntry = OverlayEntry(
       builder: (_) => Positioned(
@@ -248,7 +255,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
     );
-    Overlay.of(context).insert(_callOverlayEntry!);
+
+    try {
+      Overlay.of(context).insert(_callOverlayEntry!);
+      debugPrint('🎯 Overlay inserted successfully');
+    } catch (e) {
+      debugPrint('❌ Overlay insert error: $e');
+    }
   }
 
   @override
@@ -256,11 +269,45 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
+    final isConnected = SocketIndex.isConnected;
+    debugPrint('🔌 Socket connected on HomeScreen init: $isConnected');
     // Tell NotificationService our userId for CallKit accept navigation
     NotificationService().setMyUserId(widget.userId);
 
     _fetchRecentChats();
     _listenToNewMessages();
+
+    SocketIndex.setReconnectCallback(() {
+      debugPrint('🔁 Re-registering call listener after reconnect');
+      if (mounted) _registerCallListener();
+    });
+
+    _fcmCallSubscription = NotificationService.onForegroundCall.listen((data) {
+      if (!mounted) return;
+      if (Platform.isAndroid) {
+        final fromUserId = data['callerId'] as int? ?? 0;
+        final fromUserName = data['callerName'] as String? ?? 'Unknown';
+        final callType = data['callType'] as String? ?? 'audio';
+        final offer = data['offer'] as Map<String, dynamic>? ?? {};
+        _showIncomingCallBanner(
+          fromUserId: fromUserId,
+          fromUserName: fromUserName,
+          callType: callType,
+          offer: offer,
+        );
+      }
+    });
+
+    try {
+      SocketIndex.getSocket().onAny((event, data) {
+        debugPrint('📡 SOCKET EVENT: $event');
+      });
+    } catch (e) {}
+
+  }
+
+  void _registerCallListener() {
+    SocketEvents.offIncomingCall();
 
     SocketEvents.onIncomingCall((data) {
       if (!mounted) return;
@@ -268,7 +315,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final fromUserId = (map['fromUserId'] as num?)?.toInt() ?? 0;
       final fromUserName = (map['fromUserName'] as String?) ?? 'Unknown';
       final callType = (map['callType'] as String?) ?? 'audio';
-      final offer = map['offer'] as Map<String, dynamic>;
+      final offer = Map<String, dynamic>.from(map['offer'] as Map? ?? {});
 
       NotificationService().setPendingCall(
         callerId: fromUserId,
@@ -277,19 +324,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         offer: offer,
       );
 
-      // Show animated banner overlay instead of pushing CallScreen directly
-      _showIncomingCallBanner(
-        fromUserId: fromUserId,
-        fromUserName: fromUserName,
-        callType: callType,
-        offer: offer,
-      );
+      if (Platform.isIOS) {
+        // iOS: CallKit handles everything natively
+        NotificationService().showIncomingCall(
+          callerId: fromUserId,
+          callerName: fromUserName,
+          callType: callType,
+          offer: offer,
+        );
+      } else {
+        // Android: show in-app banner + CallKit notification
+        NotificationService().startForegroundRinging(
+          callerId: fromUserId,
+          callerName: fromUserName,
+          callType: callType,
+          offer: offer,
+        );
+        _showIncomingCallBanner(
+          fromUserId: fromUserId,
+          fromUserName: fromUserName,
+          callType: callType,
+          offer: offer,
+        );
+      }
     });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      debugPrint('📱 App resumed — checking socket');
+      final isConnected = SocketIndex.isConnected;
+      debugPrint('🔌 Socket connected: $isConnected');
+      if (!isConnected) {
+        debugPrint('🔌 Reconnecting socket...');
+        SocketIndex.getSocket(); // triggers reconnect
+      }
+      _registerCallListener(); // always re-register on resume
+      NotificationService().checkForMissedCallOnResume();
       _fetchRecentChats(silent: true);
     }
   }
@@ -461,6 +533,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _searchController.dispose();
     _callOverlayEntry?.remove();
     _callOverlayEntry = null;
+    _fcmCallSubscription?.cancel();
+
 
     try {
       final socket = SocketIndex.getSocket();

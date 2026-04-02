@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 class SocketIndex {
@@ -5,6 +7,12 @@ class SocketIndex {
   static String? _token;
   static int? _userId;
   static String? _activeConversationId;
+  static VoidCallback? _onReconnectCallback;
+
+  static void setReconnectCallback(VoidCallback callback) {
+    _onReconnectCallback = callback;
+  }
+
 
   static void setActiveConversation(String? id) {
     _activeConversationId = id;
@@ -36,9 +44,9 @@ class SocketIndex {
           .enableReconnection()
           .setReconnectionAttempts(double.infinity)
           .setReconnectionDelay(1000)
-          .setReconnectionDelayMax(10000)
+          .setReconnectionDelayMax(5000)
           .setRandomizationFactor(0.5)
-          .setTimeout(20000)
+          .setTimeout(10000)
           .build(),
     );
 
@@ -62,6 +70,11 @@ class SocketIndex {
           'conversationId': _activeConversationId,
         });
       }
+      if (_userId != null) {
+        _socket!.emit('user_online', {'userId': _userId});
+      }
+      // Re-register all listeners via callback
+      _onReconnectCallback?.call();
     });
 
     _socket!.onDisconnect((reason) {

@@ -35,7 +35,11 @@ void main() async {
     );
   }
 
+  if (Platform.isIOS) {
+    await Future.delayed(const Duration(milliseconds: 500));
+  }
   await NotificationService().init();
+
 
   runApp(
     ChangeNotifierProvider(

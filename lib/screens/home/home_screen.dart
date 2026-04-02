@@ -8,6 +8,7 @@ import '../../socket/socket_events.dart';
 import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
 import '../chat/call_screen.dart';
+import '../chat/incoming_call_overlay.dart';
 import '../login/login_screen.dart';
 import '../chat/chat_screen.dart';
 
@@ -220,12 +221,47 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _hasError = false;
   Timer? _refreshTimer;
 
+  OverlayEntry? _callOverlayEntry;
+
+  void _showIncomingCallBanner({
+    required int fromUserId,
+    required String fromUserName,
+    required String callType,
+    required Map<String, dynamic> offer,
+  }) {
+    _callOverlayEntry?.remove();
+    _callOverlayEntry = OverlayEntry(
+      builder: (_) => Positioned(
+        top: 0,
+        left: 0,
+        right: 0,
+        child: IncomingCallOverlay(
+          callerName: fromUserName,
+          callType: callType,
+          offer: offer,
+          myUserId: widget.userId,
+          callerUserId: fromUserId,
+          onDismiss: () {
+            _callOverlayEntry?.remove();
+            _callOverlayEntry = null;
+          },
+        ),
+      ),
+    );
+    Overlay.of(context).insert(_callOverlayEntry!);
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    // Tell NotificationService our userId for CallKit accept navigation
+    NotificationService().setMyUserId(widget.userId);
+
     _fetchRecentChats();
     _listenToNewMessages();
+
     SocketEvents.onIncomingCall((data) {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
@@ -234,31 +270,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final callType = (map['callType'] as String?) ?? 'audio';
       final offer = map['offer'] as Map<String, dynamic>;
 
-      // ← Start ringing
-      NotificationService().startRinging();
-      NotificationService().showIncomingCallNotification(
+      NotificationService().setPendingCall(
         callerId: fromUserId,
         callerName: fromUserName,
         callType: callType,
+        offer: offer,
       );
 
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => CallScreen(
-            myUserId: widget.userId,
-            remoteUserId: fromUserId,
-            remoteUserName: fromUserName,
-            callType: callType,
-            isOutgoing: false,
-            incomingOffer: offer,
-          ),
-        ),
-      ).then((_) {
-        // ← Stop ringing when call screen is dismissed
-        NotificationService().stopRinging();
-        NotificationService().cancelCallNotification();
-      });
+      // Show animated banner overlay instead of pushing CallScreen directly
+      _showIncomingCallBanner(
+        fromUserId: fromUserId,
+        fromUserName: fromUserName,
+        callType: callType,
+        offer: offer,
+      );
     });
   }
 
@@ -434,6 +459,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
     _searchController.dispose();
+    _callOverlayEntry?.remove();
+    _callOverlayEntry = null;
 
     try {
       final socket = SocketIndex.getSocket();

@@ -1,10 +1,10 @@
 import 'dart:async';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/notification_service.dart';
 import '../../socket/socket_events.dart';
-import '../../theme/app_theme.dart';
 
 enum CallState { idle, calling, incoming, active, ended }
 
@@ -30,8 +30,10 @@ class CallScreen extends StatefulWidget {
   State<CallScreen> createState() => _CallScreenState();
 }
 
-class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
-  // ── WebRTC ─────────────────────────────────────────────────────
+class _CallScreenState extends State<CallScreen>
+    with TickerProviderStateMixin {
+
+  // ── WebRTC ──────────────────────────────────────────────────────
   RTCPeerConnection? _pc;
   MediaStream? _localStream;
   MediaStream? _remoteStream;
@@ -40,7 +42,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   final List<RTCIceCandidate> _pendingCandidates = [];
   bool _remoteDescSet = false;
 
-  // ── UI state ───────────────────────────────────────────────────
+  // ── State ───────────────────────────────────────────────────────
   CallState _callState = CallState.calling;
   bool _isMuted = false;
   bool _isSpeakerOn = true;
@@ -51,9 +53,16 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   Timer? _timer;
   Timer? _controlsTimer;
 
-  // ── Ripple animation ───────────────────────────────────────────
-  late AnimationController _rippleCtrl;
-  late Animation<double> _ripple1, _ripple2, _ripple3;
+  // ── PiP drag ────────────────────────────────────────────────────
+  double _pipX = 0;
+  double _pipY = 0;
+  bool _pipInitialized = false;
+
+  // ── Animations ──────────────────────────────────────────────────
+  late AnimationController _pulseCtrl;
+  late AnimationController _controlsFadeCtrl;
+  late Animation<double> _pulse1, _pulse2, _pulse3;
+  late Animation<double> _controlsFade;
 
   bool get _isVideo => widget.callType == 'video';
 
@@ -64,38 +73,45 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     ],
   };
 
-  // ── Lifecycle ──────────────────────────────────────────────────
+  // ── Lifecycle ───────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _initRipple();
+    _initAnimations();
     _init();
   }
 
-  void _initRipple() {
-    _rippleCtrl = AnimationController(
+  void _initAnimations() {
+    _pulseCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 2400),
+      duration: const Duration(milliseconds: 2000),
     )..repeat();
 
-    _ripple1 = Tween(begin: 0.0, end: 1.0).animate(
+    _pulse1 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-        parent: _rippleCtrl,
-        curve: const Interval(0.0, 0.7, curve: Curves.easeOut),
-      ),
+          parent: _pulseCtrl,
+          curve: const Interval(0.0, 0.7, curve: Curves.easeOut)),
     );
-    _ripple2 = Tween(begin: 0.0, end: 1.0).animate(
+    _pulse2 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-        parent: _rippleCtrl,
-        curve: const Interval(0.2, 0.9, curve: Curves.easeOut),
-      ),
+          parent: _pulseCtrl,
+          curve: const Interval(0.2, 0.9, curve: Curves.easeOut)),
     );
-    _ripple3 = Tween(begin: 0.0, end: 1.0).animate(
+    _pulse3 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-        parent: _rippleCtrl,
-        curve: const Interval(0.4, 1.0, curve: Curves.easeOut),
-      ),
+          parent: _pulseCtrl,
+          curve: const Interval(0.4, 1.0, curve: Curves.easeOut)),
+    );
+
+    _controlsFadeCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+      value: 1.0,
+    );
+    _controlsFade = CurvedAnimation(
+      parent: _controlsFadeCtrl,
+      curve: Curves.easeInOut,
     );
   }
 
@@ -115,7 +131,8 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   void dispose() {
     _timer?.cancel();
     _controlsTimer?.cancel();
-    _rippleCtrl.dispose();
+    _pulseCtrl.dispose();
+    _controlsFadeCtrl.dispose();
     _cleanupPC();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
@@ -125,14 +142,13 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  // ── Socket listeners ───────────────────────────────────────────
+  // ── Socket ──────────────────────────────────────────────────────
 
   void _registerSocketListeners() {
     SocketEvents.onCallAnswered((data) async {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
-      final answer = map['answer'] as Map<String, dynamic>;
-      await _applyAnswer(answer);
+      await _applyAnswer(map['answer'] as Map<String, dynamic>);
     });
 
     SocketEvents.onCallEnded((_) {
@@ -143,11 +159,11 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     SocketEvents.onIceCandidate((data) async {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
-      final candidateMap = map['candidate'] as Map<String, dynamic>;
+      final c = map['candidate'] as Map<String, dynamic>;
       final candidate = RTCIceCandidate(
-        candidateMap['candidate'] as String,
-        candidateMap['sdpMid'] as String?,
-        (candidateMap['sdpMLineIndex'] as num?)?.toInt(),
+        c['candidate'] as String,
+        c['sdpMid'] as String?,
+        (c['sdpMLineIndex'] as num?)?.toInt(),
       );
       if (_remoteDescSet && _pc != null) {
         await _pc!.addCandidate(candidate);
@@ -157,18 +173,18 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     });
   }
 
-  // ── WebRTC ─────────────────────────────────────────────────────
+  // ── WebRTC ──────────────────────────────────────────────────────
 
   Future<MediaStream> _getMedia() async {
     final constraints = _isVideo
         ? {
-            'audio': true,
-            'video': {
-              'facingMode': 'user',
-              'width': {'ideal': 1280},
-              'height': {'ideal': 720},
-            },
-          }
+      'audio': true,
+      'video': {
+        'facingMode': 'user',
+        'width': {'ideal': 1280},
+        'height': {'ideal': 720},
+      },
+    }
         : {'audio': true, 'video': false};
     return navigator.mediaDevices.getUserMedia(constraints);
   }
@@ -229,9 +245,8 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _answerIncomingCall() async {
-    NotificationService().stopRinging();
-    NotificationService().cancelCallNotification();
+  Future<void> _answerCall() async {
+    NotificationService().endCall();
     if (widget.incomingOffer == null) return;
     try {
       _localStream = await _getMedia();
@@ -264,11 +279,10 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   Future<void> _applyAnswer(Map<String, dynamic> answerMap) async {
     if (_pc == null) return;
     try {
-      final answer = RTCSessionDescription(
+      await _pc!.setRemoteDescription(RTCSessionDescription(
         answerMap['sdp'] as String,
         answerMap['type'] as String,
-      );
-      await _pc!.setRemoteDescription(answer);
+      ));
       _remoteDescSet = true;
       for (final c in _pendingCandidates) await _pc!.addCandidate(c);
       _pendingCandidates.clear();
@@ -292,19 +306,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     _remoteRenderer.srcObject = null;
   }
 
-  void _handleRemoteHangup() {
-    NotificationService().stopRinging();
-    NotificationService().cancelCallNotification();
-
-    _cleanupPC();
-    if (!mounted) return;
-    setState(() => _callState = CallState.ended);
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) Navigator.pop(context);
-    });
-  }
-
-  // ── Actions ────────────────────────────────────────────────────
+  // ── Actions ─────────────────────────────────────────────────────
 
   void _startTimer() {
     _elapsed = 0;
@@ -314,9 +316,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   }
 
   void _hangup() {
-    NotificationService().stopRinging();
-    NotificationService().cancelCallNotification();
-
+    NotificationService().endAllCalls(); // ← endAllCalls not just endCall
     SocketEvents.emitEndCall(
       toUserId: widget.remoteUserId,
       fromUserId: widget.myUserId,
@@ -329,6 +329,16 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
         if (mounted) Navigator.pop(context);
       });
     }
+  }
+
+  void _handleRemoteHangup() {
+    NotificationService().endAllCalls(); // ← endAllCalls not just endCall
+    _cleanupPC();
+    if (!mounted) return;
+    setState(() => _callState = CallState.ended);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) Navigator.pop(context);
+    });
   }
 
   void _toggleMute() {
@@ -353,17 +363,24 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     setState(() => _isFrontCamera = !_isFrontCamera);
   }
 
-  void _resetControlsTimer() {
-    setState(() => _controlsVisible = true);
+  void _onTapScreen() {
+    if (_callState != CallState.active) return;
+    setState(() => _controlsVisible = !_controlsVisible);
+    _controlsVisible
+        ? _controlsFadeCtrl.forward()
+        : _controlsFadeCtrl.reverse();
     _controlsTimer?.cancel();
-    if (_callState == CallState.active) {
+    if (_controlsVisible) {
       _controlsTimer = Timer(const Duration(seconds: 4), () {
-        if (mounted) setState(() => _controlsVisible = false);
+        if (mounted && _callState == CallState.active) {
+          setState(() => _controlsVisible = false);
+          _controlsFadeCtrl.reverse();
+        }
       });
     }
   }
 
-  // ── Formatters ─────────────────────────────────────────────────
+  // ── Helpers ─────────────────────────────────────────────────────
 
   String get _elapsedLabel {
     final m = (_elapsed ~/ 60).toString().padLeft(2, '0');
@@ -371,18 +388,18 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     return '$m:$s';
   }
 
-  String get _statusText {
-    return switch (_callState) {
-      CallState.incoming => 'Incoming ${_isVideo ? 'video' : 'audio'} call',
-      CallState.calling => 'Calling…',
-      CallState.active => _elapsedLabel,
-      CallState.ended => 'Call ended',
-      CallState.idle => '',
-    };
-  }
+  String get _statusText => switch (_callState) {
+    CallState.incoming =>
+    'Incoming ${_isVideo ? 'video' : 'audio'} call',
+    CallState.calling => 'Calling…',
+    CallState.active => _elapsedLabel,
+    CallState.ended => 'Call ended',
+    CallState.idle => '',
+  };
 
   String _initials(String name) {
-    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    final parts =
+    name.trim().split(' ').where((p) => p.isNotEmpty).toList();
     if (parts.length >= 2) return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
     if (parts.length == 1) return parts[0][0].toUpperCase();
     return '?';
@@ -390,194 +407,320 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
 
   Color _avatarColor(String name) {
     const colors = [
-      Color(0xFF5C6BC0),
-      Color(0xFF26A69A),
-      Color(0xFFEF5350),
-      Color(0xFFAB47BC),
-      Color(0xFF42A5F5),
-      Color(0xFFFF7043),
-      Color(0xFF66BB6A),
-      Color(0xFFEC407A),
+      Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFEF5350),
+      Color(0xFFAB47BC), Color(0xFF42A5F5), Color(0xFFFF7043),
+      Color(0xFF66BB6A), Color(0xFFEC407A),
     ];
     return colors[name.length % colors.length];
   }
 
-  // ── Build ──────────────────────────────────────────────────────
+  // ── Build ────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    SystemChrome.setSystemUIOverlayStyle(
-      const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.light,
-      ),
-    );
-
-    if (_isVideo) return _buildVideoCallScreen();
-    return _buildAudioCallPopup();
-  }
-
-  // ══════════════════════════════════════════════════════════════
-  //  AUDIO CALL — floating popup (matches React AudioCallPopup)
-  // ══════════════════════════════════════════════════════════════
-
-  Widget _buildAudioCallPopup() {
-    final showRipple =
-        _callState == CallState.calling || _callState == CallState.incoming;
-
-    return Scaffold(
-      backgroundColor: Colors.black54,
-      body: GestureDetector(
-        onTap: () {}, // prevent dismiss on tap
-        child: Stack(
-          children: [
-            // Blurred background dismisses on tap
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: () {
-                  if (_callState == CallState.ended) Navigator.pop(context);
-                },
-                child: Container(color: Colors.transparent),
-              ),
-            ),
-            // Popup anchored to bottom center
-            Positioned(
-              bottom: 96,
-              left: 24,
-              right: 24,
-              child: _AudioPopupCard(
-                remoteUserName: widget.remoteUserName,
-                callState: _callState,
-                statusText: _statusText,
-                isMuted: _isMuted,
-                isSpeakerOn: _isSpeakerOn,
-                showRipple: showRipple,
-                ripple1: _ripple1,
-                ripple2: _ripple2,
-                ripple3: _ripple3,
-                rippleCtrl: _rippleCtrl,
-                initials: _initials(widget.remoteUserName),
-                avatarColor: _avatarColor(widget.remoteUserName),
-                elapsedLabel: _elapsedLabel,
-                onAnswer: _answerIncomingCall,
-                onDecline: _hangup,
-                onEnd: _hangup,
-                onDismiss: () => Navigator.pop(context),
-                onToggleMute: _toggleMute,
-                onToggleSpeaker: _toggleSpeaker,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ══════════════════════════════════════════════════════════════
-  //  VIDEO CALL — fullscreen (matches React VideoCallScreen)
-  // ══════════════════════════════════════════════════════════════
-
-  Widget _buildVideoCallScreen() {
-    final showRipple =
-        _callState == CallState.calling || _callState == CallState.incoming;
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+    ));
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
-        onTap: _callState == CallState.active ? _resetControlsTimer : null,
-        child: Stack(
-          children: [
-            // ── Remote video (full screen) ──
-            if (_callState == CallState.active)
-              Positioned.fill(
-                child: RTCVideoView(
-                  _remoteRenderer,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-                ),
-              ),
+        onTap: _onTapScreen,
+        child: _isVideo ? _buildVideoCall() : _buildAudioCall(),
+      ),
+    );
+  }
 
-            // ── Pre-call / ended background ──
-            if (_callState != CallState.active)
-              Positioned.fill(
-                child: Container(
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [Color(0xFF0F172A), Color(0xFF1E1B4B)],
+  // ════════════════════════════════════════════════════════════════
+  //  AUDIO CALL
+  // ════════════════════════════════════════════════════════════════
+
+  Widget _buildAudioCall() {
+    final size = MediaQuery.of(context).size;
+    final isActive = _callState == CallState.active;
+    final isIncoming = _callState == CallState.incoming;
+    final isCalling = _callState == CallState.calling;
+    final isEnded = _callState == CallState.ended;
+    final showPulse = isIncoming || isCalling;
+
+    return Stack(
+      children: [
+        // ── Background ──
+        Positioned.fill(
+          child: Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xFF0D0D1A), Color(0xFF1A0D2E), Color(0xFF0D1A1A)],
+                stops: [0.0, 0.5, 1.0],
+              ),
+            ),
+          ),
+        ),
+
+        // ── Subtle grid overlay ──
+        Positioned.fill(
+          child: CustomPaint(painter: _GridPainter()),
+        ),
+
+        // ── Avatar + name + status ──
+        Positioned.fill(
+          child: SafeArea(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Spacer(flex: 2),
+
+                // Avatar with pulse
+                if (showPulse)
+                  _PulseAvatar(
+                    initials: _initials(widget.remoteUserName),
+                    color: _avatarColor(widget.remoteUserName),
+                    pulse1: _pulse1,
+                    pulse2: _pulse2,
+                    pulse3: _pulse3,
+                    size: 100,
+                  )
+                else
+                  _StaticAvatar(
+                    initials: _initials(widget.remoteUserName),
+                    color: _avatarColor(widget.remoteUserName),
+                    size: 100,
+                  ),
+
+                const SizedBox(height: 28),
+
+                Text(
+                  widget.remoteUserName,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 26,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: -0.5,
+                  ),
+                ),
+
+                const SizedBox(height: 8),
+
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 400),
+                  child: Text(
+                    _statusText,
+                    key: ValueKey(_statusText),
+                    style: TextStyle(
+                      color: isActive
+                          ? const Color(0xFF4CAF50)
+                          : Colors.white.withOpacity(0.6),
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
                     ),
                   ),
-                  child: SafeArea(
-                    child: Column(
+                ),
+
+                const Spacer(flex: 3),
+              ],
+            ),
+          ),
+        ),
+
+        // ── Controls ──
+        Positioned(
+          bottom: 0,
+          left: 0,
+          right: 0,
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 40),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (isActive) ...[
+                    // Active: mute + speaker row above end button
+                    Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        // Avatar with ripple when calling/incoming
-                        if (showRipple)
-                          _RippleAvatar(
-                            initials: _initials(widget.remoteUserName),
-                            color: _avatarColor(widget.remoteUserName),
-                            ripple1: _ripple1,
-                            ripple2: _ripple2,
-                            ripple3: _ripple3,
-                          )
-                        else
-                          _StaticAvatar(
-                            initials: _initials(widget.remoteUserName),
-                            color: _avatarColor(widget.remoteUserName),
-                            size: 96,
-                          ),
-                        const SizedBox(height: 24),
-                        Text(
-                          widget.remoteUserName,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 24,
-                            fontWeight: FontWeight.w700,
-                          ),
+                        _RoundBtn(
+                          icon: _isMuted
+                              ? Icons.mic_off_rounded
+                              : Icons.mic_rounded,
+                          label: _isMuted ? 'Unmute' : 'Mute',
+                          active: !_isMuted,
+                          onTap: _toggleMute,
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          _statusText,
-                          style: TextStyle(
-                            color: _callState == CallState.active
-                                ? const Color(0xFF4CAF50)
-                                : Colors.white54,
-                            fontSize: 14,
-                          ),
+                        const SizedBox(width: 24),
+                        _RoundBtn(
+                          icon: _isSpeakerOn
+                              ? Icons.volume_up_rounded
+                              : Icons.volume_off_rounded,
+                          label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
+                          active: _isSpeakerOn,
+                          onTap: _toggleSpeaker,
                         ),
                       ],
                     ),
-                  ),
+                    const SizedBox(height: 32),
+                    _EndBtn(onTap: _hangup),
+                  ] else if (isIncoming) ...[
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        _ActionBtn(
+                          icon: Icons.call_end_rounded,
+                          label: 'Decline',
+                          color: const Color(0xFFE53935),
+                          onTap: _hangup,
+                        ),
+                        _ActionBtn(
+                          icon: Icons.call_rounded,
+                          label: 'Answer',
+                          color: const Color(0xFF43A047),
+                          onTap: _answerCall,
+                        ),
+                      ],
+                    ),
+                  ] else if (isCalling) ...[
+                    _EndBtn(onTap: _hangup, label: 'Cancel'),
+                  ] else if (isEnded) ...[
+                    const SizedBox(height: 16),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  VIDEO CALL
+  // ════════════════════════════════════════════════════════════════
+
+  Widget _buildVideoCall() {
+    final size = MediaQuery.of(context).size;
+    final isActive = _callState == CallState.active;
+    final isIncoming = _callState == CallState.incoming;
+    final isCalling = _callState == CallState.calling;
+    final showPulse = isIncoming || isCalling;
+
+    // Initialize PiP position (bottom right)
+    if (!_pipInitialized) {
+      _pipX = size.width - 112;
+      _pipY = size.height - 220;
+      _pipInitialized = true;
+    }
+
+    return Stack(
+      children: [
+        // ── Remote video fullscreen ──
+        if (isActive && _remoteStream != null)
+          Positioned.fill(
+            child: RTCVideoView(
+              _remoteRenderer,
+              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            ),
+          )
+        else
+        // Pre-call background
+          Positioned.fill(
+            child: Container(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    Color(0xFF0D0D1A),
+                    Color(0xFF1A0D2E),
+                    Color(0xFF0D1A1A),
+                  ],
+                  stops: [0.0, 0.5, 1.0],
                 ),
               ),
+              child: CustomPaint(painter: _GridPainter()),
+            ),
+          ),
 
-            // ── Top gradient scrim ──
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: Container(
-                height: 120,
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [Colors.black54, Colors.transparent],
-                  ),
+        // ── Blur overlay on remote video when controls visible ──
+        if (isActive && _controlsVisible)
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withOpacity(0.55),
+                    Colors.transparent,
+                    Colors.transparent,
+                    Colors.black.withOpacity(0.7),
+                  ],
+                  stops: const [0.0, 0.25, 0.6, 1.0],
                 ),
               ),
             ),
+          ),
 
-            // ── Top bar (name + timer + flip camera) ──
-            AnimatedOpacity(
-              opacity: _controlsVisible ? 1.0 : 0.0,
-              duration: const Duration(milliseconds: 400),
+        // ── Pre-call center content ──
+        if (!isActive)
+          Positioned.fill(
+            child: SafeArea(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Spacer(flex: 2),
+                  if (showPulse)
+                    _PulseAvatar(
+                      initials: _initials(widget.remoteUserName),
+                      color: _avatarColor(widget.remoteUserName),
+                      pulse1: _pulse1,
+                      pulse2: _pulse2,
+                      pulse3: _pulse3,
+                      size: 96,
+                    )
+                  else
+                    _StaticAvatar(
+                      initials: _initials(widget.remoteUserName),
+                      color: _avatarColor(widget.remoteUserName),
+                      size: 96,
+                    ),
+                  const SizedBox(height: 24),
+                  Text(
+                    widget.remoteUserName,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _statusText,
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.6),
+                      fontSize: 15,
+                    ),
+                  ),
+                  const Spacer(flex: 3),
+                ],
+              ),
+            ),
+          ),
+
+        // ── Top bar (name + timer) ──
+        if (isActive)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: FadeTransition(
+              opacity: _controlsFade,
               child: SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 20,
-                    vertical: 12,
-                  ),
+                      horizontal: 20, vertical: 12),
                   child: Row(
                     children: [
                       Expanded(
@@ -590,490 +733,241 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
                                 color: Colors.white,
                                 fontSize: 18,
                                 fontWeight: FontWeight.w700,
+                                shadows: [
+                                  Shadow(blurRadius: 8, color: Colors.black54)
+                                ],
                               ),
                             ),
                             Text(
-                              _statusText,
-                              style: TextStyle(
-                                color: _callState == CallState.active
-                                    ? const Color(0xFF4CAF50)
-                                    : Colors.white60,
+                              _elapsedLabel,
+                              style: const TextStyle(
+                                color: Color(0xFF4CAF50),
                                 fontSize: 13,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
                           ],
                         ),
                       ),
-                      if (_callState == CallState.active)
-                        GestureDetector(
-                          onTap: _switchCamera,
-                          child: Container(
-                            width: 40,
-                            height: 40,
-                            decoration: BoxDecoration(
-                              color: Colors.black38,
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white24),
-                            ),
-                            child: const Icon(
-                              Icons.flip_camera_ios_rounded,
-                              color: Colors.white,
-                              size: 18,
-                            ),
-                          ),
-                        ),
+                      // Flip camera
+                      _GlassBtn(
+                        icon: Icons.flip_camera_ios_rounded,
+                        onTap: _switchCamera,
+                      ),
                     ],
                   ),
                 ),
               ),
             ),
+          ),
 
-            // ── Local video PiP ──
-            if (_callState == CallState.active ||
-                _callState == CallState.calling)
-              Positioned(
-                bottom: 120 + MediaQuery.of(context).padding.bottom,
-                right: 16,
-                child: Container(
-                  width: 96,
-                  height: 128,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.white30, width: 2),
-                    color: Colors.black,
-                  ),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(14),
-                    child: _isVideoOff
-                        ? const Center(
-                            child: Icon(
-                              Icons.videocam_off_rounded,
-                              color: Colors.white38,
-                              size: 24,
-                            ),
-                          )
-                        : RTCVideoView(
-                            _localRenderer,
-                            mirror: _isFrontCamera,
-                            objectFit: RTCVideoViewObjectFit
-                                .RTCVideoViewObjectFitCover,
-                          ),
-                  ),
+        // ── Draggable PiP (local video) ──
+        if (isActive || isCalling)
+          Positioned(
+            left: _pipX,
+            top: _pipY,
+            child: GestureDetector(
+              onPanUpdate: (d) {
+                setState(() {
+                  _pipX = (_pipX + d.delta.dx)
+                      .clamp(0.0, size.width - 96);
+                  _pipY = (_pipY + d.delta.dy)
+                      .clamp(0.0, size.height - 128);
+                });
+              },
+              child: Container(
+                width: 96,
+                height: 128,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                      color: Colors.white.withOpacity(0.3), width: 1.5),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.4),
+                      blurRadius: 12,
+                    ),
+                  ],
                 ),
-              ),
-
-            // ── Bottom controls ──
-            Positioned(
-              bottom: 0,
-              left: 0,
-              right: 0,
-              child: AnimatedOpacity(
-                opacity: _controlsVisible ? 1.0 : 0.0,
-                duration: const Duration(milliseconds: 400),
-                child: Container(
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.bottomCenter,
-                      end: Alignment.topCenter,
-                      colors: [Colors.black87, Colors.transparent],
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(15),
+                  child: _isVideoOff
+                      ? Container(
+                    color: const Color(0xFF1E1E2E),
+                    child: const Center(
+                      child: Icon(Icons.videocam_off_rounded,
+                          color: Colors.white38, size: 24),
                     ),
-                  ),
-                  child: SafeArea(
-                    top: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
-                      child: _callState == CallState.incoming
-                          ? _buildIncomingVideoControls()
-                          : _callState == CallState.ended
-                          ? _buildEndedControls()
-                          : _buildActiveVideoControls(),
-                    ),
+                  )
+                      : RTCVideoView(
+                    _localRenderer,
+                    mirror: _isFrontCamera,
+                    objectFit: RTCVideoViewObjectFit
+                        .RTCVideoViewObjectFitCover,
                   ),
                 ),
               ),
             ),
-          ],
+          ),
+
+        // ── Bottom controls ──
+        Positioned(
+          bottom: 0,
+          left: 0,
+          right: 0,
+          child: FadeTransition(
+            opacity: isActive ? _controlsFade : const AlwaysStoppedAnimation(1.0),
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+                child: isActive
+                    ? _buildVideoActiveControls()
+                    : isIncoming
+                    ? _buildIncomingControls()
+                    : _buildCallingControls(),
+              ),
+            ),
+          ),
         ),
-      ),
+      ],
     );
   }
 
-  Widget _buildIncomingVideoControls() {
+  Widget _buildVideoActiveControls() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Top row: mute + video toggle + speaker
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.45),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _PillBtn(
+                icon: _isMuted
+                    ? Icons.mic_off_rounded
+                    : Icons.mic_rounded,
+                label: _isMuted ? 'Unmute' : 'Mute',
+                active: !_isMuted,
+                onTap: _toggleMute,
+              ),
+              _PillBtn(
+                icon: _isVideoOff
+                    ? Icons.videocam_off_rounded
+                    : Icons.videocam_rounded,
+                label: _isVideoOff ? 'Cam off' : 'Cam on',
+                active: !_isVideoOff,
+                onTap: _toggleVideo,
+              ),
+              _PillBtn(
+                icon: _isSpeakerOn
+                    ? Icons.volume_up_rounded
+                    : Icons.volume_off_rounded,
+                label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
+                active: _isSpeakerOn,
+                onTap: _toggleSpeaker,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        // End call button
+        Center(child: _EndBtn(onTap: _hangup)),
+      ],
+    );
+  }
+
+  Widget _buildIncomingControls() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
-        _CtrlBtn(
+        _ActionBtn(
           icon: Icons.call_end_rounded,
           label: 'Decline',
-          danger: true,
+          color: const Color(0xFFE53935),
           onTap: _hangup,
         ),
-        _CtrlBtn(
-          icon: Icons.videocam_rounded,
+        _ActionBtn(
+          icon: _isVideo
+              ? Icons.videocam_rounded
+              : Icons.call_rounded,
           label: 'Answer',
-          answer: true,
-          onTap: _answerIncomingCall,
+          color: const Color(0xFF43A047),
+          onTap: _answerCall,
         ),
       ],
     );
   }
 
-  Widget _buildActiveVideoControls() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: [
-        _CtrlBtn(
-          icon: _isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
-          label: _isMuted ? 'Unmute' : 'Mute',
-          active: !_isMuted,
-          onTap: _toggleMute,
-        ),
-        _CtrlBtn(
-          icon: _isVideoOff
-              ? Icons.videocam_off_rounded
-              : Icons.videocam_rounded,
-          label: _isVideoOff ? 'Cam off' : 'Cam on',
-          active: !_isVideoOff,
-          onTap: _toggleVideo,
-        ),
-        _CtrlBtn(
-          icon: Icons.call_end_rounded,
-          label: 'End',
-          danger: true,
-          onTap: _hangup,
-        ),
-        _CtrlBtn(
-          icon: _isSpeakerOn
-              ? Icons.volume_up_rounded
-              : Icons.volume_off_rounded,
-          label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
-          active: _isSpeakerOn,
-          onTap: _toggleSpeaker,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildEndedControls() {
-    return Center(
-      child: GestureDetector(
-        onTap: () => Navigator.pop(context),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
-          decoration: BoxDecoration(
-            color: Colors.white12,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: Colors.white24),
-          ),
-          child: const Text(
-            'Close',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
-          ),
-        ),
-      ),
-    );
+  Widget _buildCallingControls() {
+    return Center(child: _EndBtn(onTap: _hangup, label: 'Cancel'));
   }
 }
 
-// ══════════════════════════════════════════════════════════════════
-//  AUDIO POPUP CARD (matches React AudioCallPopup exactly)
-// ══════════════════════════════════════════════════════════════════
-
-class _AudioPopupCard extends StatelessWidget {
-  final String remoteUserName;
-  final CallState callState;
-  final String statusText;
-  final bool isMuted;
-  final bool isSpeakerOn;
-  final bool showRipple;
-  final Animation<double> ripple1, ripple2, ripple3;
-  final AnimationController rippleCtrl;
-  final String initials;
-  final Color avatarColor;
-  final String elapsedLabel;
-  final VoidCallback onAnswer;
-  final VoidCallback onDecline;
-  final VoidCallback onEnd;
-  final VoidCallback onDismiss;
-  final VoidCallback onToggleMute;
-  final VoidCallback onToggleSpeaker;
-
-  const _AudioPopupCard({
-    required this.remoteUserName,
-    required this.callState,
-    required this.statusText,
-    required this.isMuted,
-    required this.isSpeakerOn,
-    required this.showRipple,
-    required this.ripple1,
-    required this.ripple2,
-    required this.ripple3,
-    required this.rippleCtrl,
-    required this.initials,
-    required this.avatarColor,
-    required this.elapsedLabel,
-    required this.onAnswer,
-    required this.onDecline,
-    required this.onEnd,
-    required this.onDismiss,
-    required this.onToggleMute,
-    required this.onToggleSpeaker,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final isActive = callState == CallState.active;
-    final isIncoming = callState == CallState.incoming;
-    final isEnded = callState == CallState.ended;
-    final isCalling = callState == CallState.calling;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xF51E1E2E), // ~95% opacity slate-900
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: Colors.white.withOpacity(0.12)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.5),
-            blurRadius: 30,
-            offset: const Offset(0, 8),
-          ),
-        ],
-      ),
-      clipBehavior: Clip.hardEdge,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Top gradient bar (violet → purple → indigo)
-          Container(
-            height: 4,
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  Color(0xFF7C3AED),
-                  Color(0xFF9333EA),
-                  Color(0xFF6366F1),
-                ],
-              ),
-            ),
-          ),
-
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // ── Avatar section ──
-                if (showRipple)
-                  _RippleAvatar(
-                    initials: initials,
-                    color: avatarColor,
-                    ripple1: ripple1,
-                    ripple2: ripple2,
-                    ripple3: ripple3,
-                    size: 72,
-                  )
-                else
-                  _StaticAvatar(
-                    initials: initials,
-                    color: avatarColor,
-                    size: 64,
-                  ),
-
-                const SizedBox(height: 16),
-
-                Text(
-                  remoteUserName,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  statusText,
-                  style: TextStyle(
-                    color: isActive ? const Color(0xFF4CAF50) : Colors.white54,
-                    fontSize: 13,
-                  ),
-                ),
-
-                const SizedBox(height: 24),
-
-                // ── Controls ──
-                if (isIncoming)
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      _CtrlBtn(
-                        icon: Icons.call_end_rounded,
-                        label: 'Decline',
-                        danger: true,
-                        onTap: onDecline,
-                      ),
-                      const SizedBox(width: 40),
-                      _CtrlBtn(
-                        icon: Icons.call_rounded,
-                        label: 'Answer',
-                        answer: true,
-                        onTap: onAnswer,
-                      ),
-                    ],
-                  )
-                else if (isCalling || isActive)
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      _CtrlBtn(
-                        icon: isMuted
-                            ? Icons.mic_off_rounded
-                            : Icons.mic_rounded,
-                        label: isMuted ? 'Unmute' : 'Mute',
-                        active: !isMuted,
-                        onTap: onToggleMute,
-                      ),
-                      const SizedBox(width: 20),
-                      _CtrlBtn(
-                        icon: Icons.call_end_rounded,
-                        label: 'End',
-                        danger: true,
-                        onTap: isCalling ? onDecline : onEnd,
-                      ),
-                      const SizedBox(width: 20),
-                      _CtrlBtn(
-                        icon: isSpeakerOn
-                            ? Icons.volume_up_rounded
-                            : Icons.volume_off_rounded,
-                        label: isSpeakerOn ? 'Speaker' : 'Earpiece',
-                        active: isSpeakerOn,
-                        onTap: onToggleSpeaker,
-                      ),
-                    ],
-                  )
-                else if (isEnded)
-                  GestureDetector(
-                    onTap: onDismiss,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 24,
-                        vertical: 10,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: Colors.white.withOpacity(0.2),
-                        ),
-                      ),
-                      child: const Text(
-                        'Dismiss',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  SHARED WIDGETS
-// ══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
-class _RippleAvatar extends StatelessWidget {
+// Pulsing avatar for incoming/calling state
+class _PulseAvatar extends StatelessWidget {
   final String initials;
   final Color color;
-  final Animation<double> ripple1, ripple2, ripple3;
+  final Animation<double> pulse1, pulse2, pulse3;
   final double size;
 
-  const _RippleAvatar({
+  const _PulseAvatar({
     required this.initials,
     required this.color,
-    required this.ripple1,
-    required this.ripple2,
-    required this.ripple3,
-    this.size = 80,
+    required this.pulse1,
+    required this.pulse2,
+    required this.pulse3,
+    this.size = 96,
   });
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: size * 2.8,
-      height: size * 2.8,
+      width: size * 3,
+      height: size * 3,
       child: Stack(
         alignment: Alignment.center,
         children: [
-          // Ripple rings
           AnimatedBuilder(
-            animation: Listenable.merge([ripple1, ripple2, ripple3]),
-            builder: (_, __) {
-              return Stack(
-                alignment: Alignment.center,
-                children: [
-                  _buildRing(ripple1, size, 0),
-                  _buildRing(ripple2, size, 1),
-                  _buildRing(ripple3, size, 2),
-                ],
-              );
-            },
-          ),
-          // Avatar
-          Container(
-            width: size,
-            height: size,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [color, color.withBlue((color.blue * 0.7).toInt())],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: color.withOpacity(0.5),
-                  blurRadius: 20,
-                  spreadRadius: 2,
-                ),
+            animation: Listenable.merge([pulse1, pulse2, pulse3]),
+            builder: (_, __) => Stack(
+              alignment: Alignment.center,
+              children: [
+                _ring(pulse1, size, 0),
+                _ring(pulse2, size, 1),
+                _ring(pulse3, size, 2),
               ],
             ),
-            child: Center(
-              child: Text(
-                initials,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: size * 0.33,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
           ),
+          _StaticAvatar(initials: initials, color: color, size: size),
         ],
       ),
     );
   }
 
-  Widget _buildRing(Animation<double> anim, double baseSize, int index) {
-    final ringSize = baseSize + index * (baseSize * 0.45);
+  Widget _ring(Animation<double> anim, double base, int i) {
+    final s = base + i * base * 0.5;
     return Opacity(
-      opacity: (1.0 - anim.value) * 0.5,
+      opacity: (1.0 - anim.value) * 0.4,
       child: Transform.scale(
-        scale: 0.8 + anim.value * 0.7,
+        scale: 0.85 + anim.value * 0.65,
         child: Container(
-          width: ringSize,
-          height: ringSize,
+          width: s, height: s,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             border: Border.all(
-              color: const Color(0xFF7C3AED).withOpacity(0.4),
-              width: 1,
+              color: const Color(0xFF7C3AED).withOpacity(0.5),
+              width: 1.5,
             ),
           ),
         ),
@@ -1082,6 +976,7 @@ class _RippleAvatar extends StatelessWidget {
   }
 }
 
+// Static avatar circle
 class _StaticAvatar extends StatelessWidget {
   final String initials;
   final Color color;
@@ -1096,20 +991,15 @@ class _StaticAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: size,
-      height: size,
+      width: size, height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [color, color.withBlue((color.blue * 0.7).toInt())],
-        ),
+        color: color,
         boxShadow: [
           BoxShadow(
-            color: color.withOpacity(0.4),
-            blurRadius: 16,
-            spreadRadius: 2,
+            color: color.withOpacity(0.5),
+            blurRadius: 24,
+            spreadRadius: 4,
           ),
         ],
       ),
@@ -1127,43 +1017,22 @@ class _StaticAvatar extends StatelessWidget {
   }
 }
 
-// Control button — matches React CtrlBtn exactly
-class _CtrlBtn extends StatelessWidget {
+// Meet-style pill button (video call controls bar)
+class _PillBtn extends StatelessWidget {
   final IconData icon;
   final String label;
-  final VoidCallback onTap;
   final bool active;
-  final bool danger;
-  final bool answer;
+  final VoidCallback onTap;
 
-  const _CtrlBtn({
+  const _PillBtn({
     required this.icon,
     required this.label,
     required this.onTap,
     this.active = true,
-    this.danger = false,
-    this.answer = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    final Color btnColor;
-    final Color iconColor;
-
-    if (danger) {
-      btnColor = AppTheme.redAccent;
-      iconColor = Colors.white;
-    } else if (answer) {
-      btnColor = const Color(0xFF4CAF50);
-      iconColor = Colors.white;
-    } else if (!active) {
-      btnColor = Colors.white.withOpacity(0.15);
-      iconColor = Colors.white60;
-    } else {
-      btnColor = Colors.white.withOpacity(0.12);
-      iconColor = Colors.white;
-    }
-
     return GestureDetector(
       onTap: onTap,
       child: Column(
@@ -1171,38 +1040,233 @@ class _CtrlBtn extends StatelessWidget {
         children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            width: 56,
-            height: 56,
+            width: 52, height: 52,
             decoration: BoxDecoration(
-              color: btnColor,
-              borderRadius: BorderRadius.circular(16),
-              border: (!danger && !answer)
-                  ? Border.all(color: Colors.white.withOpacity(0.1))
-                  : null,
-              boxShadow: (danger || answer)
-                  ? [
-                      BoxShadow(
-                        color: btnColor.withOpacity(0.4),
-                        blurRadius: 12,
-                        offset: const Offset(0, 4),
-                      ),
-                    ]
-                  : null,
+              color: active
+                  ? Colors.white.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.06),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: active
+                    ? Colors.white.withOpacity(0.25)
+                    : Colors.white.withOpacity(0.1),
+              ),
             ),
-            child: Icon(icon, color: iconColor, size: 22),
+            child: Icon(icon,
+                color: active ? Colors.white : Colors.white38, size: 22),
           ),
           const SizedBox(height: 6),
           Text(
             label,
-            style: const TextStyle(
-              color: Colors.white60,
+            style: TextStyle(
+              color: active
+                  ? Colors.white.withOpacity(0.85)
+                  : Colors.white38,
               fontSize: 10,
               fontWeight: FontWeight.w500,
-              letterSpacing: 0.3,
             ),
           ),
         ],
       ),
     );
   }
+}
+
+// Round button for audio call controls
+class _RoundBtn extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _RoundBtn({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.active = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            width: 60, height: 60,
+            decoration: BoxDecoration(
+              color: active
+                  ? Colors.white.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.06),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: active
+                    ? Colors.white.withOpacity(0.3)
+                    : Colors.white.withOpacity(0.1),
+              ),
+            ),
+            child: Icon(icon,
+                color: active ? Colors.white : Colors.white38, size: 24),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.7),
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Red end call button
+class _EndBtn extends StatelessWidget {
+  final VoidCallback onTap;
+  final String label;
+
+  const _EndBtn({required this.onTap, this.label = 'End call'});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 68, height: 68,
+            decoration: const BoxDecoration(
+              color: Color(0xFFE53935),
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Color(0x66E53935),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: const Icon(Icons.call_end_rounded,
+                color: Colors.white, size: 28),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.7),
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Accept / Decline big action buttons
+class _ActionBtn extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _ActionBtn({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 72, height: 72,
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: color.withOpacity(0.45),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Icon(icon, color: Colors.white, size: 30),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Glass icon button (top bar)
+class _GlassBtn extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+
+  const _GlassBtn({required this.icon, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Container(
+            width: 44, height: 44,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white.withOpacity(0.2)),
+            ),
+            child: Icon(icon, color: Colors.white, size: 20),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Subtle background grid painter
+class _GridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withOpacity(0.03)
+      ..strokeWidth = 0.5;
+    const step = 40.0;
+    for (double x = 0; x < size.width; x += step) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y < size.height; y += step) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GridPainter old) => false;
 }

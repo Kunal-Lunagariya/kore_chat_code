@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:kore_chat/screens/splash/splash_screen.dart';
+import 'package:kore_chat/services/navigation_service.dart';
 import 'package:kore_chat/services/notification_service.dart';
 import 'package:provider/provider.dart';
 
@@ -51,6 +52,7 @@ class KoreChatApp extends StatelessWidget {
   Widget build(BuildContext context) {
     final themeProvider = context.watch<ThemeProvider>();
     return MaterialApp(
+      navigatorKey: NavigationService.navigatorKey,
       title: 'Kore Chat',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.lightTheme,

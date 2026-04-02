@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "1083370396976",
+    "project_id": "kore-connect-574c5",
+    "storage_bucket": "kore-connect-574c5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1083370396976:android:f10f291616d67b13af7cf5",
+        "android_client_info": {
+          "package_name": "com.koremobiles.chat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBzj9s0kdD3yE6Z1uJmyHd0JwSl2XyrGxM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1083370396976:android:c869adb5f230b5bcaf7cf5",
+        "android_client_info": {
+          "package_name": "com.koremobiles.connect"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBzj9s0kdD3yE6Z1uJmyHd0JwSl2XyrGxM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

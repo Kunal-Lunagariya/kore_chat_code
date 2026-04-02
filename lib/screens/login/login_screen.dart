@@ -1,8 +1,13 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:kore_chat/utils/custom_toast.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../services/api_call_service.dart';
+import '../../services/notification_service.dart';
+import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
 import '../home/home_screen.dart';
 
@@ -23,6 +28,7 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _isPasswordVisible = false;
   bool _isLoading = false;
   bool _rememberMe = false;
+  String _appVersion = '';
 
   static const String _prefEmail = 'saved_email';
   static const String _prefPassword = 'saved_password';
@@ -32,6 +38,14 @@ class _LoginScreenState extends State<LoginScreen> {
   void initState() {
     super.initState();
     _loadRememberedCredentials();
+    _loadAppVersion();
+  }
+
+  Future<void> _loadAppVersion() async {
+    final info = await PackageInfo.fromPlatform();
+    setState(() {
+      _appVersion = "v${info.version}";
+    });
   }
 
   // ── SharedPreferences helpers ──────────────────────────────────
@@ -86,6 +100,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
         // 1. Set token in ApiCall service
         ApiCall.setAuthToken(token);
+        SocketIndex.connectSocket(token, userId: userId);
 
         // 2. Persist to SharedPreferences so splash can auto-login next time
         final prefs = await SharedPreferences.getInstance();
@@ -93,6 +108,22 @@ class _LoginScreenState extends State<LoginScreen> {
         await prefs.setInt('user_id', userId);
         await prefs.setString('user_name', userName);
         await prefs.setString('user_email', email);
+
+        try {
+          final fcmToken = NotificationService().fcmToken;
+          if (fcmToken != null && fcmToken.isNotEmpty) {
+            await ApiCall.post(
+              'v1/user/user-device',
+              data: {
+                'userId': userId,
+                'deviceType': Platform.isIOS ? 'ios' : 'android',
+                'fcmToken': fcmToken,
+              },
+            );
+          }
+        } catch (_) {
+          CustomToast.showError(context, "Error in send token to server");
+        }
 
         // 3. Save credentials if remember me is on
         await _saveCredentials();
@@ -156,7 +187,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 const SizedBox(height: 28),
                 _buildLoginButton(),
                 const SizedBox(height: 16),
-                _buildForgotPassword(isDark),
+                // _buildForgotPassword(isDark),
                 const SizedBox(height: 48),
                 _buildFooter(isDark),
                 const SizedBox(height: 32),
@@ -218,7 +249,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ),
                   const TextSpan(
-                    text: 'CHAT',
+                    text: 'CIRCLE',
                     style: TextStyle(
                       color: AppTheme.redAccent,
                       fontSize: 22,
@@ -374,7 +405,7 @@ class _LoginScreenState extends State<LoginScreen> {
       ),
       cursorColor: AppTheme.redAccent,
       decoration: InputDecoration(
-        hintText: '••••••••',
+        hintText: '• • • • • •',
         prefixIcon: Icon(
           Icons.lock_outline_rounded,
           color: isDark
@@ -398,7 +429,6 @@ class _LoginScreenState extends State<LoginScreen> {
       ),
       validator: (value) {
         if (value == null || value.isEmpty) return 'Please enter your password';
-        if (value.length < 6) return 'Password must be at least 6 characters';
         return null;
       },
     );
@@ -586,7 +616,7 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
         const SizedBox(height: 16),
         Text(
-          'Kore Chat v1.0.0 · Secure Business Messaging',
+          'Kore Circle $_appVersion · Secure Business Messaging',
           textAlign: TextAlign.center,
           style: TextStyle(
             color: isDark

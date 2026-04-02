@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../services/api_call_service.dart';
+import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
 import '../home/home_screen.dart';
 import '../login/login_screen.dart';
@@ -35,11 +36,12 @@ class _SplashScreenState extends State<SplashScreen> {
     if (!mounted) return;
 
     if (token != null && token.isNotEmpty) {
-      // Restore token to ApiCall service
       ApiCall.setAuthToken(token);
 
       final userId = prefs.getInt(_prefUserId) ?? 0;
       final userName = prefs.getString(_prefUserName) ?? '';
+
+      SocketIndex.connectSocket(token, userId: userId);
 
       Navigator.pushReplacement(
         context,

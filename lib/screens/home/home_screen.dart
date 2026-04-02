@@ -3,7 +3,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../services/api_call_service.dart';
+import '../../services/notification_service.dart';
+import '../../socket/socket_events.dart';
+import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
+import '../chat/call_screen.dart';
 import '../login/login_screen.dart';
 import '../chat/chat_screen.dart';
 
@@ -50,6 +54,9 @@ class RecentChat {
   final String? fileType;
   final String? fileMimeType;
   final String? fileName;
+  final int? callId;
+  final int? callType;
+  final String? callStatus;
 
   RecentChat({
     required this.conversationId,
@@ -74,6 +81,9 @@ class RecentChat {
     this.fileType,
     this.fileMimeType,
     this.fileName,
+    this.callId,
+    this.callType,
+    this.callStatus,
   });
 
   factory RecentChat.fromJson(Map<String, dynamic> json) {
@@ -104,21 +114,31 @@ class RecentChat {
       fileType: json['fileType'] as String?,
       fileMimeType: json['fileMimeType'] as String?,
       fileName: json['fileName'] as String?,
+      callId: (json['callId'] as num?)?.toInt(),
+      callType: (json['callType'] as num?)?.toInt(),
+      callStatus: json['callStatus'] as String?,
     );
   }
 
   bool get isMediaMessage =>
       lastMessageText.isEmpty &&
-      (fileUrl != null || lastMessageMediaId != null);
+      (fileUrl != null || lastMessageMediaId != null) &&
+      callId == null;
 
   String get previewText {
+    // Call message takes priority
+    if (callId != null) {
+      final type = callType == 2 ? 'Video call' : 'Audio call';
+      final status = callStatus == 'Ended' ? 'Ended' : callStatus ?? '';
+      return '$type · $status';
+    }
     if (isMediaMessage) {
       if (fileType == 'image') return 'Photo';
       if (fileType == 'video') return 'Video';
       if (fileType == 'audio') return 'Audio';
       return 'File';
     }
-    return lastMessageId != null ? lastMessageText : 'No messages yet';
+    return lastMessageText.isNotEmpty ? lastMessageText : 'No messages yet';
   }
 
   String get displayName =>
@@ -193,6 +213,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
+  int? _openConversationId;
 
   List<RecentChat> _chats = [];
   bool _isLoading = true;
@@ -204,10 +225,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _fetchRecentChats();
-    _refreshTimer = Timer.periodic(
-      const Duration(seconds: 30),
-      (_) => _fetchRecentChats(silent: true),
-    );
+    _listenToNewMessages();
+    SocketEvents.onIncomingCall((data) {
+      if (!mounted) return;
+      final map = Map<String, dynamic>.from(data as Map);
+      final fromUserId = (map['fromUserId'] as num?)?.toInt() ?? 0;
+      final fromUserName = (map['fromUserName'] as String?) ?? 'Unknown';
+      final callType = (map['callType'] as String?) ?? 'audio';
+      final offer = map['offer'] as Map<String, dynamic>;
+
+      // ← Start ringing
+      NotificationService().startRinging();
+      NotificationService().showIncomingCallNotification(
+        callerId: fromUserId,
+        callerName: fromUserName,
+        callType: callType,
+      );
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CallScreen(
+            myUserId: widget.userId,
+            remoteUserId: fromUserId,
+            remoteUserName: fromUserName,
+            callType: callType,
+            isOutgoing: false,
+            incomingOffer: offer,
+          ),
+        ),
+      ).then((_) {
+        // ← Stop ringing when call screen is dismissed
+        NotificationService().stopRinging();
+        NotificationService().cancelCallNotification();
+      });
+    });
   }
 
   @override
@@ -217,11 +269,180 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _listenToNewMessages() {
+    try {
+      final socket = SocketIndex.getSocket();
+
+      socket.on('recent_chat_update', (data) {
+        if (!mounted) return;
+        try {
+          final msg = Map<String, dynamic>.from(data as Map);
+          final conversationId = (msg['conversationId'] as num?)?.toInt() ?? 0;
+          final senderId = (msg['senderId'] as num?)?.toInt() ?? 0;
+          final messageId = (msg['id'] as num?)?.toInt() ?? 0;
+          final isMine = senderId == widget.userId;
+          final isOpenConversation = _openConversationId == conversationId;
+
+          // ← Emit delivered if not mine and chat not open
+          if (!isMine && !isOpenConversation) {
+            SocketEvents.emitMessageStatus(
+              receiverId: widget.userId,
+              senderId: senderId,
+              conversationId: conversationId,
+              messageId: messageId,
+              status: 'delivered',
+            );
+          }
+
+          setState(() {
+            final idx = _chats.indexWhere(
+              (c) => c.conversationId == conversationId,
+            );
+
+            if (idx != -1) {
+              final old = _chats[idx];
+              final updated = RecentChat(
+                conversationId: old.conversationId,
+                myIsMuted: old.myIsMuted,
+                themUserId: old.themUserId,
+                themUserName: old.themUserName,
+                themUserRole: old.themUserRole,
+                themIsOnline: old.themIsOnline,
+                groupName: old.groupName,
+                conversationType: old.conversationType,
+                createdBy: old.createdBy,
+                createdByName: old.createdByName,
+                createdAt: old.createdAt,
+                lastMessageId: (msg['id'] as num?)?.toInt(),
+                lastMessageTime: DateTime.tryParse(
+                  msg['createdAt'] as String? ?? '',
+                ),
+                lastMessageText: (msg['messageText'] as String?) ?? '',
+                lastMessageSenderId: (msg['senderId'] as num?)?.toInt() ?? 0,
+                lastMessageType: (msg['messageType'] as String?) ?? 'text',
+                lastMessageMediaId: (msg['mediaId'] as num?)?.toInt(),
+
+                unRead: isMine || isOpenConversation ? 0 : old.unRead + 1,
+                fileUrl: msg['fileUrl'] as String?,
+                fileType: msg['fileType'] as String?,
+                fileMimeType: msg['fileMimeType'] as String?,
+                fileName: msg['fileName'] as String?,
+              );
+
+              _chats.removeAt(idx);
+              _chats.insert(0, updated); // move to top
+            } else {
+              // New conversation not in list yet — fetch to get full data
+              _fetchRecentChats(silent: true);
+            }
+          });
+
+          // Show notification only if message is not mine and chat is not open
+          if (!isMine && !isOpenConversation) {
+            final chat = _chats.firstWhere(
+              (c) => c.conversationId == conversationId,
+              orElse: () => _chats.first,
+            );
+            NotificationService().showMessageNotification(
+              conversationId: conversationId,
+              senderName: chat.themUserName,
+              message: (msg['messageText'] as String?) ?? '',
+              isGroup: chat.conversationType == 2,
+              groupName: chat.groupName,
+            );
+          }
+        } catch (_) {}
+      });
+      SocketEvents.onUserOnline((data) {
+        if (!mounted) return;
+        final map = Map<String, dynamic>.from(data as Map);
+        final userId = (map['userId'] as num?)?.toInt() ?? 0;
+        setState(() {
+          _chats = _chats.map((c) {
+            if (c.themUserId == userId) {
+              return RecentChat(
+                conversationId: c.conversationId,
+                myIsMuted: c.myIsMuted,
+                themUserId: c.themUserId,
+                themUserName: c.themUserName,
+                themUserRole: c.themUserRole,
+                themIsOnline: true, // ← updated
+                groupName: c.groupName,
+                conversationType: c.conversationType,
+                createdBy: c.createdBy,
+                createdByName: c.createdByName,
+                createdAt: c.createdAt,
+                lastMessageId: c.lastMessageId,
+                lastMessageTime: c.lastMessageTime,
+                lastMessageText: c.lastMessageText,
+                lastMessageSenderId: c.lastMessageSenderId,
+                lastMessageType: c.lastMessageType,
+                lastMessageMediaId: c.lastMessageMediaId,
+                unRead: c.unRead,
+                fileUrl: c.fileUrl,
+                fileType: c.fileType,
+                fileMimeType: c.fileMimeType,
+                fileName: c.fileName,
+              );
+            }
+            return c;
+          }).toList();
+        });
+      });
+
+      SocketEvents.onUserOffline((data) {
+        if (!mounted) return;
+        final map = Map<String, dynamic>.from(data as Map);
+        final userId = (map['userId'] as num?)?.toInt() ?? 0;
+        setState(() {
+          _chats = _chats.map((c) {
+            if (c.themUserId == userId) {
+              return RecentChat(
+                conversationId: c.conversationId,
+                myIsMuted: c.myIsMuted,
+                themUserId: c.themUserId,
+                themUserName: c.themUserName,
+                themUserRole: c.themUserRole,
+                themIsOnline: false, // ← updated
+                groupName: c.groupName,
+                conversationType: c.conversationType,
+                createdBy: c.createdBy,
+                createdByName: c.createdByName,
+                createdAt: c.createdAt,
+                lastMessageId: c.lastMessageId,
+                lastMessageTime: c.lastMessageTime,
+                lastMessageText: c.lastMessageText,
+                lastMessageSenderId: c.lastMessageSenderId,
+                lastMessageType: c.lastMessageType,
+                lastMessageMediaId: c.lastMessageMediaId,
+                unRead: c.unRead,
+                fileUrl: c.fileUrl,
+                fileType: c.fileType,
+                fileMimeType: c.fileMimeType,
+                fileName: c.fileName,
+              );
+            }
+            return c;
+          }).toList();
+        });
+      });
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
     _searchController.dispose();
+
+    try {
+      final socket = SocketIndex.getSocket();
+      socket.off('recent_chat_update');
+      socket.off('incoming_call');
+      socket.off('user_online');
+      socket.off('user_offline');
+    } catch (_) {}
+
     super.dispose();
   }
 
@@ -247,6 +468,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _isLoading = false;
           _hasError = false;
         });
+
+        // ← Emit delivered for all unread on load
+        SocketEvents.emitMultiMessageStatusDelivered(receiverId: widget.userId);
       } else {
         setState(() {
           _isLoading = false;
@@ -279,6 +503,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.remove('user_name');
     await prefs.remove('user_email');
     ApiCall.clearAuthToken();
+    SocketIndex.disconnectSocket();
     if (mounted) {
       Navigator.pushAndRemoveUntil(
         context,
@@ -297,6 +522,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         currentUserId: widget.userId,
         myUserId: widget.userId,
         onChatOpened: (conversationId, themUserId, themUserName, themIsOnline) {
+          setState(() => _openConversationId = conversationId);
           Navigator.push(
             context,
             MaterialPageRoute(
@@ -308,7 +534,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 myUserId: widget.userId,
               ),
             ),
-          ).then((_) => _fetchRecentChats(silent: true));
+          ).then((_) async {
+            await Future.delayed(const Duration(milliseconds: 500));
+            if (mounted) setState(() => _openConversationId = null);
+          });
         },
       ),
     );
@@ -581,8 +810,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-
-
   Widget _buildBody(bool isDark) {
     if (_isLoading) {
       return Center(
@@ -696,6 +923,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         child: InkWell(
           borderRadius: BorderRadius.circular(16),
           onTap: () async {
+            setState(() {
+              _openConversationId = chat.conversationId;
+              // Clear unread badge immediately when chat is opened
+              final idx = _chats.indexWhere(
+                (c) => c.conversationId == chat.conversationId,
+              );
+              if (idx != -1 && _chats[idx].unRead > 0) {
+                final old = _chats[idx];
+                _chats[idx] = RecentChat(
+                  conversationId: old.conversationId,
+                  myIsMuted: old.myIsMuted,
+                  themUserId: old.themUserId,
+                  themUserName: old.themUserName,
+                  themUserRole: old.themUserRole,
+                  themIsOnline: old.themIsOnline,
+                  groupName: old.groupName,
+                  conversationType: old.conversationType,
+                  createdBy: old.createdBy,
+                  createdByName: old.createdByName,
+                  createdAt: old.createdAt,
+                  lastMessageId: old.lastMessageId,
+                  lastMessageTime: old.lastMessageTime,
+                  lastMessageText: old.lastMessageText,
+                  lastMessageSenderId: old.lastMessageSenderId,
+                  lastMessageType: old.lastMessageType,
+                  lastMessageMediaId: old.lastMessageMediaId,
+                  unRead: 0, // ← clear immediately
+                  fileUrl: old.fileUrl,
+                  fileType: old.fileType,
+                  fileMimeType: old.fileMimeType,
+                  fileName: old.fileName,
+                );
+              }
+            });
             await Navigator.push(
               context,
               MaterialPageRoute(
@@ -708,7 +969,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ),
               ),
             );
-            _fetchRecentChats(silent: true);
+            await Future.delayed(const Duration(milliseconds: 500));
+            if (mounted) setState(() => _openConversationId = null);
           },
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
@@ -776,7 +1038,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       const SizedBox(height: 3),
                       Row(
                         children: [
-                          if (chat.isMediaMessage)
+                          if (chat.callId != null)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 4),
+                              child: Icon(
+                                chat.callType == 2
+                                    ? Icons.videocam_outlined
+                                    : Icons.call_outlined,
+                                size: 14,
+                                color: isDark
+                                    ? AppTheme.darkTextSecondary.withOpacity(
+                                        0.6,
+                                      )
+                                    : AppTheme.lightTextSecondary.withOpacity(
+                                        0.6,
+                                      ),
+                              ),
+                            )
+                          else if (chat.isMediaMessage)
                             Padding(
                               padding: const EdgeInsets.only(right: 4),
                               child: Icon(
@@ -1193,7 +1472,7 @@ class _NewChatModalState extends State<_NewChatModal> {
         'v1/chat/group',
         data: {
           'groupName': groupName,
-          'memberIds': _selectedUsers.map((u) => u.value).toList(),
+          'userIds': _selectedUsers.map((u) => u.value).toList(),
         },
       );
 
@@ -1639,7 +1918,8 @@ class _NewChatModalState extends State<_NewChatModal> {
   }
 
   Widget _buildSelectedChips(bool isDark) {
-    if (!_isMultiSelect || _selectedUsers.isEmpty) return const SizedBox.shrink();
+    if (!_isMultiSelect || _selectedUsers.isEmpty)
+      return const SizedBox.shrink();
     return SizedBox(
       height: 44,
       child: ListView.separated(
@@ -1682,7 +1962,9 @@ class _NewChatModalState extends State<_NewChatModal> {
                 Text(
                   user.label.split(' ').first, // first name only
                   style: TextStyle(
-                    color: isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary,
+                    color: isDark
+                        ? AppTheme.darkTextPrimary
+                        : AppTheme.lightTextPrimary,
                     fontSize: 12,
                     fontWeight: FontWeight.w500,
                   ),

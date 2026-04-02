@@ -93,7 +93,7 @@ class ApiCall {
       final response = await client
           .get(url, headers: requestHeaders)
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 90),
             onTimeout: () {
               throw Exception(
                 'Request timeout. Please check your internet connection.',
@@ -132,7 +132,7 @@ class ApiCall {
             body: data != null ? jsonEncode(data) : null,
           )
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 90),
             onTimeout: () {
               throw Exception(
                 'Request timeout. Please check your internet connection.',
@@ -166,7 +166,7 @@ class ApiCall {
             body: data != null ? jsonEncode(data) : null,
           )
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 90),
             onTimeout: () {
               throw Exception(
                 'Request timeout. Please check your internet connection.',
@@ -200,7 +200,7 @@ class ApiCall {
             body: data != null ? jsonEncode(data) : null,
           )
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 90),
             onTimeout: () {
               throw Exception(
                 'Request timeout. Please check your internet connection.',
@@ -234,7 +234,7 @@ class ApiCall {
             body: data != null ? jsonEncode(data) : null,
           )
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 90),
             onTimeout: () {
               throw Exception(
                 'Request timeout. Please check your internet connection.',
@@ -273,6 +273,7 @@ class ApiCall {
         request.headers['Authorization'] = 'Bearer $_authToken';
       request.headers['appname'] = appName;
       request.headers['appversion'] = appVersion ?? '1.0.0';
+      request.headers['X-Tunnel-Skip-Browser-Warning'] = 'true';
       if (headers != null) {
         headers.remove('Content-Type');
         request.headers.addAll(headers);
@@ -288,8 +289,26 @@ class ApiCall {
       if (fields != null) request.fields.addAll(fields);
       streamedResponse = await client
           .send(request)
-          .timeout(const Duration(seconds: 60));
-      client.close();
+          .timeout(const Duration(seconds: 90));
+
+      // ← Read bytes BEFORE closing client
+      final statusCode = streamedResponse.statusCode;
+      final bodyBytes = await streamedResponse.stream.toBytes();
+      client.close(); // ← close AFTER reading
+
+      if (kDebugMode) {
+        print('Upload Response Status: $statusCode');
+        print(
+          'Upload Response Body: ${utf8.decode(bodyBytes, allowMalformed: true)}',
+        );
+      }
+
+      final response = http.Response.bytes(
+        bodyBytes,
+        statusCode,
+        headers: Map<String, String>.from(streamedResponse.headers),
+      );
+      return _handleResponse(response);
     } else {
       var request = http.MultipartRequest('POST', url);
       if (_authToken != null)
@@ -310,16 +329,19 @@ class ApiCall {
       );
       if (fields != null) request.fields.addAll(fields);
       streamedResponse = await request.send().timeout(
-        const Duration(seconds: 60),
+        const Duration(seconds: 90),
       );
-    }
 
-    final response = await http.Response.fromStream(streamedResponse);
-    if (kDebugMode) {
-      print('Upload Response Status: ${response.statusCode}');
-      print('Upload Response Body: ${response.body}');
+      final statusCode = streamedResponse.statusCode;
+      final bodyBytes = await streamedResponse.stream.toBytes();
+
+      final response = http.Response.bytes(
+        bodyBytes,
+        statusCode,
+        headers: Map<String, String>.from(streamedResponse.headers),
+      );
+      return _handleResponse(response);
     }
-    return _handleResponse(response);
   }
 
   // ── Response handler ───────────────────────────────────────────

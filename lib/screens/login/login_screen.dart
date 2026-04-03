@@ -21,10 +21,10 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController(
-    // text: 'lunagariyakrunal26@gmail.com',
+    text: 'lunagariyakrunal26@gmail.com',
   );
   final _passwordController = TextEditingController(
-    // text: 'pawanputra'
+    text: 'pawanputra',
   );
 
   bool _isPasswordVisible = false;
@@ -113,6 +113,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
         try {
           final fcmToken = NotificationService().fcmToken;
+          final voipToken = NotificationService().voipToken;
+
           if (fcmToken != null && fcmToken.isNotEmpty) {
             await ApiCall.post(
               'v1/user/user-device',
@@ -120,6 +122,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 'userId': userId,
                 'deviceType': Platform.isIOS ? 'ios' : 'android',
                 'fcmToken': fcmToken,
+                'voIpToken': voipToken,
               },
             );
           }

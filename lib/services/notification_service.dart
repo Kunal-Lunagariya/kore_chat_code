@@ -23,6 +23,8 @@ class NotificationService {
 
   String? _fcmToken;
   String? get fcmToken => _fcmToken;
+  String? _voipToken;
+  String? get voipToken => _voipToken;
   String? _currentCallUuid;
 
   // Pending call — set by socket when app is foreground
@@ -105,6 +107,12 @@ class NotificationService {
 
     _fcmToken = await _getTokenWithRetry();
     debugPrint('📱 FCM Token: $_fcmToken');
+
+    if (Platform.isIOS) {
+      final voip = await FlutterCallkitIncoming.getDevicePushTokenVoIP();
+      _voipToken = voip;
+      debugPrint("📱 VoIP Token Saved: $_voipToken");
+    }
 
     _fcm.onTokenRefresh.listen((token) {
       _fcmToken = token;
@@ -310,17 +318,25 @@ class NotificationService {
     debugPrint('📞 CallKit event: ${event.event}');
 
     switch (event.event) {
+      case Event.actionDidUpdateDevicePushTokenVoip:
+        _voipToken = event.body['devicePushTokenVoip'];
+        debugPrint('📱 VoIP Token: $_voipToken');
+        break;
+
       case Event.actionCallAccept:
         _onCallAccepted(event.body);
         break;
+
       case Event.actionCallDecline:
         _onCallDeclined(event.body);
         break;
+
       case Event.actionCallEnded:
       case Event.actionCallTimeout:
         _currentCallUuid = null;
         clearPendingCall();
         break;
+
       default:
         break;
     }

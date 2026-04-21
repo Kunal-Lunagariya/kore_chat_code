@@ -1,12 +1,13 @@
+import 'package:flutter/cupertino.dart';
+
 import 'socket_index.dart';
 
 class SocketEvents {
-
   /// Join a conversation room
   static void joinConversation(
-      String conversationId, {
-        Function(dynamic)? callback,
-      }) {
+    String conversationId, {
+    Function(dynamic)? callback,
+  }) {
     final socket = SocketIndex.getSocket();
     SocketIndex.setActiveConversation(conversationId);
 
@@ -19,7 +20,7 @@ class SocketEvents {
     );
   }
 
-  /// Leave conversation
+  /// Leave conversation.
   static void leaveConversation(String conversationId) {
     final socket = SocketIndex.getSocket();
     socket.emit('leave_conversation', {'conversationId': conversationId});
@@ -28,9 +29,9 @@ class SocketEvents {
 
   /// Send message
   static void sendMessage(
-      Map<String, dynamic> payload, {
-        Function(dynamic)? callback,
-      }) {
+    Map<String, dynamic> payload, {
+    Function(dynamic)? callback,
+  }) {
     final socket = SocketIndex.getSocket();
 
     socket.emitWithAck(
@@ -189,26 +190,38 @@ class SocketEvents {
     required int toUserId,
     required dynamic answer,
     required String callType,
+    int? roomId,
+    int? conversationId,
   }) {
     final socket = SocketIndex.getSocket();
     socket.emit('answer_call', {
       'toUserId': toUserId,
       'answer': answer,
       'callType': callType,
+      if (roomId != null) 'roomId': roomId,
+      if (conversationId != null) 'conversationId': conversationId,
     });
   }
 
   static void emitEndCall({
     required int toUserId,
     required int fromUserId,
-    int statusId = 5, // 5 = ended, 2 = declined, 1 = missed
+    int statusId = 5,
+    int? roomId,
+    int? conversationId,
   }) {
-    final socket = SocketIndex.getSocket();
-    socket.emit('end_call', {
-      'toUserId': toUserId,
-      'fromUserId': fromUserId,
-      'statusId': statusId,
-    });
+    try {
+      final socket = SocketIndex.getSocket();
+      socket.emit('end_call', {
+        'toUserId': toUserId,
+        'fromUserId': fromUserId,
+        'statusId': statusId,
+        if (roomId != null) 'roomId': roomId,
+        if (conversationId != null) 'conversationId': conversationId,
+      });
+    } catch (e) {
+      debugPrint('⚠️ emitEndCall failed: $e');
+    }
   }
 
   static void emitIceCandidate({
@@ -262,24 +275,228 @@ class SocketEvents {
     socket.off('ice_candidate');
   }
 
-  static void onUserOnline(Function(dynamic) handler) {
-    final socket = SocketIndex.getSocket();
-    socket.on('user_online', handler);
-  }
-
   static void offUserOnline() {
     final socket = SocketIndex.getSocket();
     socket.off('user_online');
   }
 
-  static void onUserOffline(Function(dynamic) handler) {
-    final socket = SocketIndex.getSocket();
-    socket.on('user_offline', handler);
+  static void emitCallRinging({required int toUserId}) {
+    try {
+      final socket = SocketIndex.getSocket();
+      socket.emit('call_ringing', {'toUserId': toUserId});
+    } catch (_) {}
   }
 
-  static void offUserOffline() {
+  static void onCallRinging(Function(dynamic) handler) {
     final socket = SocketIndex.getSocket();
-    socket.off('user_offline');
+    socket.on('call_ringing', handler);
   }
 
+  static void offCallRinging() {
+    final socket = SocketIndex.getSocket();
+    socket.off('call_ringing');
+  }
+
+  static void onOnlineUsers(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('online_users', handler);
+  }
+
+  static void offOnlineUsers() {
+    final socket = SocketIndex.getSocket();
+    socket.off('online_users');
+  }
+
+  static void onUserStatus(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('user_status', handler);
+  }
+
+  static void offUserStatus() {
+    final socket = SocketIndex.getSocket();
+    socket.off('user_status');
+  }
+
+  static void onCallUnavailableWait(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('call_unavailable_wait', handler);
+  }
+
+  static void offCallUnavailableWait() {
+    final socket = SocketIndex.getSocket();
+    socket.off('call_unavailable_wait');
+  }
+
+  static void onCallRingingNow(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('call_ringing_now', handler);
+  }
+
+  static void offCallRingingNow() {
+    final socket = SocketIndex.getSocket();
+    socket.off('call_ringing_now');
+  }
+
+  // ── Group call events ──────────────────────────────────────────
+
+  static void emitGroupCallInitiate({
+    required int conversationId,
+    required int callerId,
+    required String callType,
+  }) {
+    final socket = SocketIndex.getSocket();
+    socket.emit('group_call_initiate', {
+      'conversationId': conversationId,
+      'callerId': callerId,
+      'callType': callType,
+    });
+  }
+
+  static void emitGroupCallJoin({
+    required int conversationId,
+    required int userId,
+  }) {
+    final socket = SocketIndex.getSocket();
+    socket.emit('group_call_join', {
+      'conversationId': conversationId,
+      'userId': userId,
+    });
+  }
+
+  static void emitGroupCallLeave({
+    required int conversationId,
+    required int userId,
+  }) {
+    try {
+      final socket = SocketIndex.getSocket();
+      socket.emit('group_call_leave', {
+        'conversationId': conversationId,
+        'userId': userId,
+      });
+    } catch (_) {}
+  }
+
+  static void emitGroupCallEnd({
+    required int conversationId,
+    required int userId,
+  }) {
+    try {
+      final socket = SocketIndex.getSocket();
+      socket.emit('group_call_end', {
+        'conversationId': conversationId,
+        'userId': userId,
+      });
+    } catch (_) {}
+  }
+
+  static void emitGroupCallOffer({
+    required int toUserId,
+    required int conversationId,
+    required Map<String, dynamic> offer,
+    required String callType,
+  }) {
+    final socket = SocketIndex.getSocket();
+    socket.emit('group_call_offer', {
+      'toUserId': toUserId,
+      'conversationId': conversationId,
+      'offer': offer,
+      'callType': callType,
+    });
+  }
+
+  static void emitGroupCallAnswer({
+    required int toUserId,
+    required int conversationId,
+    required Map<String, dynamic> answer,
+  }) {
+    final socket = SocketIndex.getSocket();
+    socket.emit('group_call_answer', {
+      'toUserId': toUserId,
+      'conversationId': conversationId,
+      'answer': answer,
+    });
+  }
+
+  static void emitGroupCallIceCandidate({
+    required int toUserId,
+    required int conversationId,
+    required Map<String, dynamic> candidate,
+  }) {
+    final socket = SocketIndex.getSocket();
+    socket.emit('group_call_ice_candidate', {
+      'toUserId': toUserId,
+      'conversationId': conversationId,
+      'candidate': candidate,
+    });
+  }
+
+  static void onGroupCallIncoming(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_incoming', handler);
+  }
+
+  static void offGroupCallIncoming() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_incoming');
+  }
+
+  static void onGroupCallUserJoined(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_user_joined', handler);
+  }
+
+  static void offGroupCallUserJoined() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_user_joined');
+  }
+
+  static void onGroupCallUserLeft(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_user_left', handler);
+  }
+
+  static void offGroupCallUserLeft() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_user_left');
+  }
+
+  static void onGroupCallOffer(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_offer', handler);
+  }
+
+  static void offGroupCallOffer() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_offer');
+  }
+
+  static void onGroupCallAnswer(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_answer', handler);
+  }
+
+  static void offGroupCallAnswer() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_answer');
+  }
+
+  static void onGroupCallIceCandidate(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_ice_candidate', handler);
+  }
+
+  static void offGroupCallIceCandidate() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_ice_candidate');
+  }
+
+  static void onGroupCallEnded(Function(dynamic) handler) {
+    final socket = SocketIndex.getSocket();
+    socket.on('group_call_ended', handler);
+  }
+
+  static void offGroupCallEnded() {
+    final socket = SocketIndex.getSocket();
+    socket.off('group_call_ended');
+  }
 }

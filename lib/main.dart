@@ -7,12 +7,10 @@ import 'package:kore_chat/services/navigation_service.dart';
 import 'package:kore_chat/services/notification_service.dart';
 import 'package:provider/provider.dart';
 
-import 'services/api_call_service.dart';
 import 'theme/app_theme.dart';
 import 'theme/theme_provider.dart';
 
 void main() async {
-
   WidgetsFlutterBinding.ensureInitialized();
 
   if (Platform.isIOS) {
@@ -40,7 +38,6 @@ void main() async {
   }
   await NotificationService().init();
 
-
   runApp(
     ChangeNotifierProvider(
       create: (_) => ThemeProvider(),
@@ -66,3 +63,5 @@ class KoreChatApp extends StatelessWidget {
     );
   }
 }
+
+// latest updated code

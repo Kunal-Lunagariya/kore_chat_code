@@ -18,6 +18,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'call_screen.dart';
+import 'group_call_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   final int conversationId;
@@ -25,6 +26,9 @@ class ChatScreen extends StatefulWidget {
   final String themUserName;
   final bool themIsOnline;
   final int myUserId;
+  final Set<int> onlineUserIds;
+  final bool isGroup;
+  final List<Map<String, dynamic>> groupMembers;
 
   const ChatScreen({
     super.key,
@@ -33,6 +37,9 @@ class ChatScreen extends StatefulWidget {
     required this.themUserName,
     required this.themIsOnline,
     required this.myUserId,
+    required this.onlineUserIds,
+    this.isGroup = false,
+    this.groupMembers = const [],
   });
 
   @override
@@ -63,6 +70,8 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _pendingAudioPath;
   String? _pendingDocPath;
   String? _pendingDocName;
+  List<Map<String, dynamic>> _groupMembers = [];
+  bool _loadingMembers = false;
 
   // Pagination
   int _page = 1;
@@ -77,6 +86,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _showScrollToBottom = false;
 
   bool _isScrollingToMessage = false;
+
+  bool get _isOnline => widget.onlineUserIds.contains(widget.themUserId);
 
   @override
   void initState() {
@@ -1284,121 +1295,149 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // ── AppBar ─────────────────────────────────
 
+  Color _senderColor(int senderId) {
+    const colors = [
+      Color(0xFF7C3AED),
+      Color(0xFF0EA5E9),
+      Color(0xFF10B981),
+      Color(0xFFF59E0B),
+      Color(0xFFEF4444),
+      Color(0xFFEC4899),
+      Color(0xFF8B5CF6),
+      Color(0xFF14B8A6),
+    ];
+    return colors[senderId % colors.length];
+  }
 
   Widget _buildAppBar(bool isDark) {
-    return Container(
-      color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
-      child: SafeArea(
-        bottom: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(4, 8, 8, 10),
-          child: Row(
-            children: [
-              IconButton(
-                onPressed: () => Navigator.pop(context),
-                icon: Icon(
-                  Icons.arrow_back_ios_new_rounded,
-                  size: 20,
-                  color: isDark
-                      ? AppTheme.darkTextPrimary
-                      : AppTheme.lightTextPrimary,
-                ),
-              ),
-              // Avatar
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: _avatarColor(widget.themUserName),
-                  shape: BoxShape.circle,
-                ),
-                child: Center(
-                  child: Text(
-                    _initials(widget.themUserName),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 14,
-                    ),
+    return GestureDetector(
+      onTap: widget.isGroup ? () => _showGroupInfoSheet(isDark) : null,
+      child: Container(
+        color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+        child: SafeArea(
+          bottom: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(4, 8, 8, 10),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: () => Navigator.pop(context),
+                  icon: Icon(
+                    Icons.arrow_back_ios_new_rounded,
+                    size: 20,
+                    color: isDark
+                        ? AppTheme.darkTextPrimary
+                        : AppTheme.lightTextPrimary,
                   ),
                 ),
-              ),
-              const SizedBox(width: 10),
-              // Name + status
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      widget.themUserName,
-                      style: TextStyle(
-                        color: isDark
-                            ? AppTheme.darkTextPrimary
-                            : AppTheme.lightTextPrimary,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
+                // Avatar
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: _avatarColor(widget.themUserName),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Center(
+                    child: widget.isGroup
+                        ? const Icon(
+                            Icons.group_rounded,
+                            color: Colors.white,
+                            size: 20,
+                          )
+                        : Text(
+                            _initials(widget.themUserName),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                            ),
+                          ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                // Name + status/member count
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        widget.themUserName,
+                        style: TextStyle(
+                          color: isDark
+                              ? AppTheme.darkTextPrimary
+                              : AppTheme.lightTextPrimary,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    Row(
-                      children: [
-                        Container(
-                          width: 7,
-                          height: 7,
-                          decoration: BoxDecoration(
-                            color: widget.themIsOnline
-                                ? const Color(0xFF4CAF50)
-                                : (isDark
-                                ? AppTheme.darkTextSecondary
-                                : AppTheme.lightTextSecondary),
-                            shape: BoxShape.circle,
-                          ),
+                      Text(
+                        widget.isGroup
+                            ? '${widget.groupMembers.length} members · tap for info'
+                            : (_isTyping
+                                  ? 'typing...'
+                                  : (_isOnline ? 'online' : 'offline')),
+                        style: TextStyle(
+                          color: !widget.isGroup && _isTyping
+                              ? const Color(0xFF7C3AED)
+                              : (!widget.isGroup && _isOnline
+                                    ? const Color(0xFF4CAF50)
+                                    : (isDark
+                                          ? AppTheme.darkTextSecondary
+                                          : AppTheme.lightTextSecondary)),
+                          fontSize: 12,
                         ),
-                        const SizedBox(width: 5),
-                        Text(
-                          _isTyping
-                              ? 'typing...'
-                              : (widget.themIsOnline ? 'online' : 'offline'),
-                          style: TextStyle(
-                            color: _isTyping
-                                ? const Color(0xFF7C3AED)
-                                : (widget.themIsOnline
-                                ? const Color(0xFF4CAF50)
-                                : (isDark
-                                ? AppTheme.darkTextSecondary
-                                : AppTheme.lightTextSecondary)),
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
+                      ),
+                    ],
+                  ),
+                ),
+                // Call buttons — 1-to-1 only
+                if (!widget.isGroup) ...[
+                  IconButton(
+                    onPressed: () => widget.isGroup
+                        ? _startGroupCall('audio')
+                        : _startCall('audio'),
+                    icon: Icon(
+                      Icons.call_rounded,
+                      size: 22,
+                      color: isDark
+                          ? AppTheme.darkTextSecondary
+                          : AppTheme.lightTextSecondary,
                     ),
-                  ],
-                ),
-              ),
-              // Audio call
-              IconButton(
-                onPressed: () => _startCall('audio'),
-                icon: Icon(
-                  Icons.call_rounded,
-                  size: 22,
-                  color: isDark
-                      ? AppTheme.darkTextSecondary
-                      : AppTheme.lightTextSecondary,
-                ),
-              ),
-              // Video call
-              IconButton(
-                onPressed: () => _startCall('video'),
-                icon: Icon(
-                  Icons.videocam_rounded,
-                  size: 24,
-                  color: isDark
-                      ? AppTheme.darkTextSecondary
-                      : AppTheme.lightTextSecondary,
-                ),
-              ),
-            ],
+                  ),
+                  IconButton(
+                    onPressed: () => widget.isGroup
+                        ? _startGroupCall('video')
+                        : _startCall('video'),
+                    icon: Icon(
+                      Icons.videocam_rounded,
+                      size: 24,
+                      color: isDark
+                          ? AppTheme.darkTextSecondary
+                          : AppTheme.lightTextSecondary,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
+        ),
+      ),
+    );
+  }
+
+  void _startGroupCall(String callType) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GroupCallScreen(
+          myUserId: widget.myUserId,
+          conversationId: widget.conversationId,
+          groupName: widget.themUserName,
+          callType: callType,
+          isInitiator: true,
+          groupMembers: widget.groupMembers,
         ),
       ),
     );
@@ -1539,22 +1578,95 @@ class _ChatScreenState extends State<ChatScreen> {
 
         final msg = _messages[msgIndex];
         final key = _messageKeys.putIfAbsent(msg.id, () => GlobalKey());
+
+        // olderMsg = next in array = older message (list is reversed)
         final olderMsg = msgIndex + 1 < _messages.length
             ? _messages[msgIndex + 1]
             : null;
+        // newerMsg = prev in array = newer message (list is reversed)
+        final newerMsg = msgIndex > 0 ? _messages[msgIndex - 1] : null;
+
         final showDate =
             olderMsg == null || msg.createdAt.day != olderMsg.createdAt.day;
-        final newerMsg = msgIndex > 0 ? _messages[msgIndex - 1] : null;
-        final isLastInGroup = newerMsg == null || newerMsg.sender != msg.sender;
+
+        // isFirstInGroup = this message starts a new sender streak from above
+        // In reversed list: sender changed compared to the OLDER message
+        final isFirstInGroup =
+            olderMsg == null || olderMsg.senderId != msg.senderId;
+
+        // isLastInGroup = bottom of a sender streak, used for bubble tail
+        final isLastInGroup =
+            newerMsg == null || newerMsg.senderId != msg.senderId;
 
         return Column(
           key: key,
           children: [
             if (showDate) _buildDateSeparator(msg.dateLabel, isDark),
-            _buildMessageBubble(msg, isLastInGroup, isDark),
+            _buildMessageBubble(
+              msg,
+              isFirstInGroup: isFirstInGroup,
+              isLastInGroup: isLastInGroup,
+              isDark: isDark,
+            ),
           ],
         );
       },
+    );
+  }
+
+  Widget _buildMessageBubble(
+    ChatMessage msg, {
+    required bool isFirstInGroup,
+    required bool isLastInGroup,
+    required bool isDark,
+  }) {
+    final isMe = msg.isMe;
+    final isHighlighted = _highlightedMessageId == msg.id;
+
+    // Show sender name above the FIRST message of a group streak (not mine)
+    final showSenderName = widget.isGroup && !isMe && isFirstInGroup;
+
+    return GestureDetector(
+      onLongPress: () => _showMessageOptions(msg, isDark),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        color: isHighlighted
+            ? const Color(0xFF7C3AED).withOpacity(0.15)
+            : Colors.transparent,
+        child: Padding(
+          padding: EdgeInsets.only(
+            // More space after last message in a group streak
+            bottom: isLastInGroup ? 6 : 2,
+            left: isMe ? 60 : 0,
+            right: isMe ? 0 : 60,
+          ),
+          child: Align(
+            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+            child: Column(
+              crossAxisAlignment: isMe
+                  ? CrossAxisAlignment.end
+                  : CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Sender name above first bubble in a group streak
+                if (showSenderName)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 12, bottom: 3),
+                    child: Text(
+                      msg.senderName.trim().split(' ').first,
+                      style: TextStyle(
+                        color: _senderColor(msg.senderId),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                _buildBubbleContent(msg, isMe, isDark),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1653,33 +1765,150 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ── Individual bubble ──────────────────────
-
-  Widget _buildMessageBubble(ChatMessage msg, bool isLastInGroup, bool isDark) {
-    final isMe = msg.isMe;
-    final isHighlighted = _highlightedMessageId == msg.id;
-
-    return GestureDetector(
-      onLongPress: () => _showMessageOptions(msg, isDark),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        color: isHighlighted
-            ? const Color(0xFF7C3AED).withOpacity(0.15) // ← light purple
-            : Colors.transparent,
-        child: Padding(
-          padding: EdgeInsets.only(
-            bottom: isLastInGroup ? 6 : 2,
-            left: isMe ? 60 : 0,
-            right: isMe ? 0 : 60,
+  void _showGroupInfoSheet(bool isDark) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.55,
+        minChildSize: 0.35,
+        maxChildSize: 0.9,
+        builder: (_, scrollCtrl) => Container(
+          decoration: BoxDecoration(
+            color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
           ),
-          child: Align(
-            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-            child: _buildBubbleContent(msg, isMe, isDark),
+          child: Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 20),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? Colors.white.withOpacity(0.15)
+                      : Colors.black.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: _avatarColor(widget.themUserName),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.group_rounded,
+                  color: Colors.white,
+                  size: 30,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                widget.themUserName,
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.darkTextPrimary
+                      : AppTheme.lightTextPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${widget.groupMembers.length} members',
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.darkTextSecondary
+                      : AppTheme.lightTextSecondary,
+                  fontSize: 13,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Divider(
+                color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
+                height: 1,
+              ),
+              Expanded(
+                child: ListView.builder(
+                  controller: scrollCtrl,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  itemCount: widget.groupMembers.length,
+                  itemBuilder: (_, i) {
+                    final m = widget.groupMembers[i];
+                    // API returns 'UserName' (capital U N)
+                    final name =
+                        (m['UserName'] as String?) ??
+                        (m['userName'] as String?) ??
+                        'Unknown';
+                    final userId = (m['userId'] as num?)?.toInt() ?? 0;
+                    final role = (m['role'] as String?) ?? 'Member';
+                    final isMe = userId == widget.myUserId;
+
+                    return ListTile(
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 4,
+                        vertical: 2,
+                      ),
+                      leading: Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          color: _avatarColor(name),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Center(
+                          child: Text(
+                            _initials(name),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 15,
+                            ),
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        isMe ? '$name (You)' : name,
+                        style: TextStyle(
+                          color: isDark
+                              ? AppTheme.darkTextPrimary
+                              : AppTheme.lightTextPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      subtitle: Text(
+                        role,
+                        style: TextStyle(
+                          color: role == 'Admin'
+                              ? const Color(0xFF7C3AED)
+                              : (isDark
+                                    ? AppTheme.darkTextSecondary
+                                    : AppTheme.lightTextSecondary),
+                          fontSize: 12,
+                          fontWeight: role == 'Admin'
+                              ? FontWeight.w600
+                              : FontWeight.normal,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
         ),
       ),
     );
   }
+
+  // ── Individual bubble ──────────────────────
 
   Widget _buildCallBubble(ChatMessage msg, bool isMe, bool isDark) {
     final isVideo = msg.isVideoCall;
@@ -1687,15 +1916,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final duration = msg.duration;
 
     // Parse status color + icon
-    final isMissed = status.toLowerCase() == 'missed' ||
-        status.toLowerCase() == 'declined';
+    final isMissed =
+        status.toLowerCase() == 'missed' || status.toLowerCase() == 'declined';
 
     final Color statusColor = isMissed
         ? AppTheme.redAccent
         : (isDark ? AppTheme.darkTextSecondary : AppTheme.lightTextSecondary);
 
-    final IconData callIcon =
-    isVideo ? Icons.videocam_rounded : Icons.call_rounded;
+    final IconData callIcon = isVideo
+        ? Icons.videocam_rounded
+        : Icons.call_rounded;
 
     // Format duration — "00:00:58" → "0:58", "00:01:30" → "1:30"
     String? durationLabel;
@@ -1732,8 +1962,8 @@ class _ChatScreenState extends State<ChatScreen> {
         border: isMe
             ? null
             : Border.all(
-          color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
-        ),
+                color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
+              ),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       child: Row(
@@ -1747,8 +1977,8 @@ class _ChatScreenState extends State<ChatScreen> {
               color: isMissed
                   ? AppTheme.redAccent.withOpacity(isMe ? 0.25 : 0.12)
                   : (isMe
-                  ? Colors.white.withOpacity(0.15)
-                  : AppTheme.redAccent.withOpacity(0.1)),
+                        ? Colors.white.withOpacity(0.15)
+                        : AppTheme.redAccent.withOpacity(0.1)),
               shape: BoxShape.circle,
             ),
             child: Icon(
@@ -1768,9 +1998,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 Text(
                   isVideo ? 'Video Call' : 'Audio Call',
                   style: TextStyle(
-                    color: isMe ? Colors.white : (isDark
-                        ? AppTheme.darkTextPrimary
-                        : AppTheme.lightTextPrimary),
+                    color: isMe
+                        ? Colors.white
+                        : (isDark
+                              ? AppTheme.darkTextPrimary
+                              : AppTheme.lightTextPrimary),
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                   ),
@@ -1798,17 +2030,15 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                     const SizedBox(width: 3),
                     Text(
-                      isMissed
-                          ? 'Missed'
-                          : (durationLabel ?? status),
+                      isMissed ? 'Missed' : (durationLabel ?? status),
                       style: TextStyle(
                         color: isMissed
                             ? (isMe
-                            ? Colors.white.withOpacity(0.7)
-                            : AppTheme.redAccent)
+                                  ? Colors.white.withOpacity(0.7)
+                                  : AppTheme.redAccent)
                             : (isMe
-                            ? Colors.white.withOpacity(0.6)
-                            : statusColor),
+                                  ? Colors.white.withOpacity(0.6)
+                                  : statusColor),
                         fontSize: 11,
                       ),
                     ),
@@ -1828,8 +2058,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   color: isMe
                       ? Colors.white.withOpacity(0.6)
                       : (isDark
-                      ? AppTheme.darkTextSecondary
-                      : AppTheme.lightTextSecondary),
+                            ? AppTheme.darkTextSecondary
+                            : AppTheme.lightTextSecondary),
                   fontSize: 10,
                 ),
               ),
@@ -1873,7 +2103,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   end: Alignment.bottomRight,
                 )
               : null,
-          color: isMe ? null : (isDark ? AppTheme.darkCard : AppTheme.lightCard),
+          color: isMe
+              ? null
+              : (isDark ? AppTheme.darkCard : AppTheme.lightCard),
           borderRadius: BorderRadius.only(
             topLeft: const Radius.circular(16),
             topRight: const Radius.circular(16),
@@ -1923,8 +2155,8 @@ class _ChatScreenState extends State<ChatScreen> {
                       color: isMe
                           ? Colors.white.withOpacity(0.6)
                           : (isDark
-                          ? AppTheme.darkTextSecondary
-                          : AppTheme.lightTextSecondary),
+                                ? AppTheme.darkTextSecondary
+                                : AppTheme.lightTextSecondary),
                       fontSize: 10,
                     ),
                   ),

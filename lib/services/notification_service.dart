@@ -7,8 +7,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
 import 'package:flutter_callkit_incoming/entities/entities.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../screens/chat/call_screen.dart';
+import '../socket/socket_events.dart';
+import '../socket/socket_index.dart';
 import 'firebase_messaging_service.dart';
 import 'navigation_service.dart';
 
@@ -32,11 +35,21 @@ class NotificationService {
   int? _pendingCallerId;
   String? _pendingCallerName;
   String? _pendingCallType;
+  int? _pendingMessageId;
+  int? _pendingRoomId;
+  int? _pendingConversationId;
   int? _myUserId;
+  bool _callAcceptBroadcast = false;
 
-  static final _incomingCallController = StreamController<Map<String, dynamic>>.broadcast();
-  static Stream<Map<String, dynamic>> get onForegroundCall => _incomingCallController.stream;
+  static final _incomingCallController =
+      StreamController<Map<String, dynamic>>.broadcast();
+  static Stream<Map<String, dynamic>> get onForegroundCall =>
+      _incomingCallController.stream;
 
+  static final _callAcceptedController =
+      StreamController<Map<String, dynamic>>.broadcast();
+  static Stream<Map<String, dynamic>> get onCallAccepted =>
+      _callAcceptedController.stream;
 
   // ── Public setters ─────────────────────────────────────────────
 
@@ -47,11 +60,17 @@ class NotificationService {
     required String callerName,
     required String callType,
     required Map<String, dynamic> offer,
+    int? messageId,
+    int? roomId,
+    int? conversationId,
   }) {
     _pendingCallerId = callerId;
     _pendingCallerName = callerName;
     _pendingCallType = callType;
     _pendingOffer = offer;
+    _pendingMessageId = messageId;
+    _pendingRoomId = roomId;
+    _pendingConversationId = conversationId;
   }
 
   void clearPendingCall() {
@@ -59,6 +78,10 @@ class NotificationService {
     _pendingCallerId = null;
     _pendingCallerName = null;
     _pendingCallType = null;
+    _pendingMessageId = null;
+    _pendingRoomId = null;
+    _pendingConversationId = null;
+    _callAcceptBroadcast = false;
   }
 
   // ── Init ───────────────────────────────────────────────────────
@@ -133,24 +156,12 @@ class NotificationService {
     FlutterCallkitIncoming.onEvent.listen(_onCallKitEvent);
   }
 
-
   Future<void> startForegroundRinging({
     required int callerId,
     required String callerName,
     required String callType,
     Map<String, dynamic>? offer,
   }) async {
-    // On iOS foreground: don't show CallKit (it covers the banner)
-    // Just store the call data — banner is already showing
-    // Vibration handles attention
-    if (Platform.isIOS) {
-      // Vibrate to alert user — no CallKit UI in foreground
-      HapticFeedback.heavyImpact();
-      _startVibration();
-      return;
-    }
-
-    // Android: use CallKit notification normally
     await showIncomingCall(
       callerId: callerId,
       callerName: callerName,
@@ -183,9 +194,10 @@ class NotificationService {
       final calls = await FlutterCallkitIncoming.activeCalls();
       debugPrint('📞 Active calls on resume: $calls');
       if (calls != null && (calls as List).isNotEmpty) {
-        final call = (calls as List).first as Map;
+        final call = (calls).first as Map;
         final extra = call['extra'] as Map? ?? {};
-        final callerId = int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
+        final callerId =
+            int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
         final callerName = extra['callerName']?.toString() ?? 'Unknown';
         final callType = extra['callType']?.toString() ?? 'audio';
         final offerStr = extra['offerJson']?.toString() ?? '';
@@ -247,9 +259,10 @@ class NotificationService {
     final data = message.data;
     final type = data['type'] ?? 'message';
 
-    debugPrint('📨 FCM foreground message type: $type');
+    debugPrint('📨 FCM foreground type: $type');
 
     if (type == 'call') {
+      // Store offer from FCM as fallback (socket usually arrives first)
       final callerId = int.tryParse(data['callerId'] ?? '0') ?? 0;
       final callerName = data['callerName'] ?? 'Unknown';
       final callType = data['callType'] ?? 'audio';
@@ -262,39 +275,32 @@ class NotificationService {
         } catch (_) {}
       }
 
-      debugPrint('📞 FCM call — callerId: $callerId, callerName: $callerName');
+      // Only store if socket hasn't already set it
+      if (_pendingOffer == null || _pendingOffer!.isEmpty) {
+        setPendingCall(
+          callerId: callerId,
+          callerName: callerName,
+          callType: callType,
+          offer: offer,
+        );
+        debugPrint('📞 FCM stored pending call offer as fallback');
+      }
 
-      setPendingCall(
-        callerId: callerId,
-        callerName: callerName,
-        callType: callType,
-        offer: offer,
-      );
-
-      // Emit to stream — home_screen will show banner
-      _incomingCallController.add({
-        'callerId': callerId,
-        'callerName': callerName,
-        'callType': callType,
-        'offer': offer,
-      });
-
-      // Show CallKit for lock screen ring
-      await showIncomingCall(
-        callerId: callerId,
-        callerName: callerName,
-        callType: callType,
-        offer: offer,
-      );
+      // Don't show any UI here — socket onIncomingCall handles it
       return;
     }
 
+    // Messages — iOS handled natively by Firebase, Android handled below
     if (Platform.isAndroid) {
       final conversationId = int.tryParse(data['conversationId'] ?? '0') ?? 0;
+      final messageText = data['message'] ?? '';
+      final senderName = data['senderName'] ?? '';
+      if (senderName.isEmpty && messageText.isEmpty) return;
+
       await showMessageNotification(
         conversationId: conversationId,
-        senderName: data['senderName'] ?? 'New Message',
-        message: data['message'] ?? '',
+        senderName: senderName.isEmpty ? 'New Message' : senderName,
+        message: messageText,
         isGroup: data['isGroup'] == 'true',
         groupName: data['groupName'] as String?,
       );
@@ -333,6 +339,16 @@ class NotificationService {
 
       case Event.actionCallEnded:
       case Event.actionCallTimeout:
+        // ← ADD: emit missed to caller if we didn't answer
+        if (_myUserId != null && _pendingCallerId != null) {
+          try {
+            SocketEvents.emitEndCall(
+              toUserId: _pendingCallerId!,
+              fromUserId: _myUserId!,
+              statusId: 1, // 1 = missed
+            );
+          } catch (_) {}
+        }
         _currentCallUuid = null;
         clearPendingCall();
         break;
@@ -343,47 +359,50 @@ class NotificationService {
   }
 
   Future<void> _onCallAccepted(dynamic body) async {
-    debugPrint('✅ CallKit accepted: $body');
-
-    // Wait for navigator to be ready (app may be launching)
-    NavigatorState? navigator;
-    for (int i = 0; i < 20; i++) {
-      navigator = NavigationService.navigatorKey.currentState;
-      if (navigator != null) break;
-      debugPrint('⏳ Waiting for navigator... attempt ${i + 1}');
-      await Future.delayed(const Duration(milliseconds: 300));
-    }
-
-    if (navigator == null) {
-      debugPrint('⚠️ Navigator never became ready');
-      await endAllCalls();
+    if (_callAcceptBroadcast) {
+      debugPrint('⚠️ _onCallAccepted already fired — ignoring duplicate');
       return;
     }
+    _callAcceptBroadcast = true;
 
-    // Priority 1: offer stored by socket (foreground/background)
+    debugPrint('✅ CallKit accepted: $body');
+
     Map<String, dynamic>? offer = _pendingOffer;
     int? callerId = _pendingCallerId;
-    String callerName = _pendingCallerName ?? 'Unknown';
+    String callerName = _pendingCallerName ?? '';
     String callType = _pendingCallType ?? 'audio';
 
-    // Priority 2: offer from CallKit extra (app was killed)
-    if (offer == null || offer.isEmpty) {
-      try {
-        final extra = (body is Map)
-            ? Map<String, dynamic>.from(body['extra'] as Map? ?? {})
-            : <String, dynamic>{};
-        final offerStr = extra['offerJson']?.toString() ?? '';
+    // Always try to read from extra first — most reliable on cold start
+    try {
+      final extra = (body is Map)
+          ? Map<String, dynamic>.from(body['extra'] as Map? ?? {})
+          : <String, dynamic>{};
+
+      // Offer
+      if (offer == null || offer.isEmpty) {
+        final offerStr =
+            extra['offerJson']?.toString() ?? extra['offer']?.toString() ?? '';
         if (offerStr.isNotEmpty) {
-          final decoded = jsonDecode(offerStr);
-          offer = Map<String, dynamic>.from(decoded as Map);
+          try {
+            offer = Map<String, dynamic>.from(jsonDecode(offerStr) as Map);
+          } catch (e) {
+            debugPrint('⚠️ offer decode failed: $e');
+          }
         }
-        callerId ??= int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
-        callerName = extra['callerName']?.toString() ?? callerName;
-        callType = extra['callType']?.toString() ?? callType;
-        debugPrint('📦 Offer from CallKit extra: ${offer?.keys}');
-      } catch (e) {
-        debugPrint('⚠️ Could not parse offer from extra: $e');
       }
+
+      // Caller info from extra (fallback if socket didn't set pending)
+      if (callerId == null || callerId == 0) {
+        callerId = int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
+      }
+      if (callerName.isEmpty) {
+        callerName = extra['callerName']?.toString() ?? 'Unknown';
+      }
+      callType = extra['callType']?.toString().isNotEmpty == true
+          ? extra['callType'].toString()
+          : callType;
+    } catch (e) {
+      debugPrint('⚠️ Could not parse extra: $e');
     }
 
     if (offer == null || offer.isEmpty) {
@@ -392,39 +411,112 @@ class NotificationService {
       return;
     }
 
-    if (_myUserId == null || callerId == null || callerId == 0) {
-      debugPrint('⚠️ Missing userId (${_myUserId}) or callerId ($callerId)');
+    if (callerId == null || callerId == 0) {
+      debugPrint('⚠️ Missing callerId');
       await endAllCalls();
       return;
     }
 
-    final finalOffer = Map<String, dynamic>.from(offer);
-    final finalCallerId = callerId;
-    final finalCallerName = callerName;
-    final finalCallType = callType;
-    final finalMyUserId = _myUserId!;
+    // ── KEY FIX: Read myUserId from prefs if not set (cold start) ──
+    if (_myUserId == null) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _myUserId = prefs.getInt('user_id');
+        debugPrint('📱 Loaded myUserId from prefs: $_myUserId');
+      } catch (e) {
+        debugPrint('⚠️ Could not read user_id from prefs: $e');
+      }
+    }
 
-    navigator
-        .push(
-          MaterialPageRoute(
-            builder: (_) => CallScreen(
-              myUserId: finalMyUserId,
-              remoteUserId: finalCallerId,
-              remoteUserName: finalCallerName,
-              callType: finalCallType,
-              isOutgoing: false,
-              incomingOffer: finalOffer,
-            ),
-          ),
-        )
-        .then((_) {
-          clearPendingCall();
-          endAllCalls();
-        });
+    if (_myUserId == null) {
+      debugPrint('⚠️ myUserId still null — cannot start call');
+      await endAllCalls();
+      return;
+    }
+
+    debugPrint('📞 Broadcasting call accept: caller=$callerName id=$callerId');
+
+    _callAcceptedController.add({
+      'callerId': callerId,
+      'callerName': callerName,
+      'callType': callType,
+      'offer': offer,
+      'myUserId': _myUserId!,
+      'messageId': _pendingMessageId,
+      'roomId': _pendingRoomId,
+      'conversationId': _pendingConversationId,
+    });
+  }
+
+  // ── ADDED: Wait for socket to connect (up to 8 seconds) ──────────
+  Future<void> _ensureSocketConnected() async {
+    try {
+      // If already connected, nothing to do
+      if (SocketIndex.isConnected) {
+        debugPrint('✅ Socket already connected');
+        return;
+      }
+
+      debugPrint('🔄 Socket not connected — attempting connect before call...');
+
+      // Try to get/reconnect existing socket
+      try {
+        SocketIndex.getSocket(); // triggers reconnect inside getSocket()
+      } catch (e) {
+        // Socket not initialized (killed state) — need token from prefs
+        debugPrint('⚠️ Socket not initialized, reading token from prefs...');
+        final prefs = await SharedPreferences.getInstance();
+        final token = prefs.getString('auth_token');
+        final userId = prefs.getInt('user_id');
+        if (token != null) {
+          SocketIndex.connectSocket(token, userId: userId);
+        } else {
+          debugPrint('⚠️ No auth token in prefs — cannot connect socket');
+          return;
+        }
+      }
+
+      // Wait up to 8 seconds for socket to connect
+      const maxWaitMs = 8000;
+      const stepMs = 200;
+      int waited = 0;
+      while (!SocketIndex.isConnected && waited < maxWaitMs) {
+        await Future.delayed(const Duration(milliseconds: stepMs));
+        waited += stepMs;
+        debugPrint('⏳ Waiting for socket... ${waited}ms');
+      }
+
+      if (SocketIndex.isConnected) {
+        debugPrint('✅ Socket connected after ${waited}ms');
+        // Small extra delay for server-side room setup
+        await Future.delayed(const Duration(milliseconds: 300));
+      } else {
+        debugPrint(
+          '⚠️ Socket still not connected after ${waited}ms — proceeding anyway',
+        );
+      }
+    } catch (e) {
+      debugPrint('⚠️ _ensureSocketConnected error: $e');
+    }
   }
 
   void _onCallDeclined(dynamic body) {
     debugPrint('❌ CallKit declined');
+
+    // ← ADD: emit end_call so caller's screen closes
+    if (_pendingCallerId != null && _myUserId != null) {
+      try {
+        SocketEvents.emitEndCall(
+          toUserId: _pendingCallerId!,
+          fromUserId: _myUserId!,
+          statusId: 2, // 2 = declined
+        );
+        debugPrint('📞 Decline emitted to callerId: $_pendingCallerId');
+      } catch (e) {
+        debugPrint('⚠️ decline socket error: $e');
+      }
+    }
+
     clearPendingCall();
     endAllCalls();
   }
@@ -443,11 +535,42 @@ class NotificationService {
         'Messages',
         description: 'New chat message notifications',
         importance: Importance.high,
-        sound: RawResourceAndroidNotificationSound('kore_message'),
-        playSound: true,
+        // ← REMOVE sound lines — file doesn't exist
         enableVibration: true,
       ),
     );
+  }
+
+  Future<void> showMessageNotification({
+    required int conversationId,
+    required String senderName,
+    required String message,
+    bool isGroup = false,
+    String? groupName,
+  }) async {
+    final title = isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
+    final body = message.isEmpty ? '📎 Media' : message;
+
+    if (Platform.isAndroid) {
+      final androidDetails = AndroidNotificationDetails(
+        'kore_messages',
+        'Messages',
+        channelDescription: 'New chat message notifications',
+        importance: Importance.high,
+        priority: Priority.high,
+        // ← REMOVE: sound: const RawResourceAndroidNotificationSound('kore_message'),
+        styleInformation: BigTextStyleInformation(body),
+        groupKey: 'kore_chat_$conversationId',
+        autoCancel: true,
+      );
+      await _plugin.show(
+        conversationId,
+        title,
+        body,
+        NotificationDetails(android: androidDetails),
+        payload: 'chat_$conversationId',
+      );
+    }
   }
 
   // ── Show incoming call (CallKit) ───────────────────────────────
@@ -458,6 +581,13 @@ class NotificationService {
     required String callType,
     Map<String, dynamic>? offer,
   }) async {
+    if (_callAcceptBroadcast) {
+      debugPrint('⚠️ showIncomingCall blocked — call already accepted');
+      return;
+    }
+
+    await FlutterCallkitIncoming.endAllCalls();
+
     _currentCallUuid = const Uuid().v4();
 
     // Store offer as JSON string in extra so killed-app accept can use it
@@ -468,7 +598,7 @@ class NotificationService {
       nameCaller: callerName,
       appName: 'Kore Circle',
       type: callType == 'video' ? 1 : 0,
-      duration: 45000,
+      duration: 30000,
       textAccept: 'Accept',
       textDecline: 'Decline',
       extra: <String, dynamic>{
@@ -480,14 +610,12 @@ class NotificationService {
       headers: <String, dynamic>{},
       android: AndroidParams(
         isCustomNotification: true,
-        isShowLogo: false,
+        isShowLogo: false, // ← change to false
         ringtonePath: 'system_ringtone_default',
-        backgroundColor: '#1E1E2E',
-        backgroundUrl: null,
-        actionColor: '#7C3AED',
-        textColor: '#FFFFFF',
-        incomingCallNotificationChannelName: 'Incoming Calls',
-        missedCallNotificationChannelName: 'Missed Calls',
+        backgroundColor: '#0955FA',
+        actionColor: '#4CAF50',
+        textColor: '#ffffff',
+        incomingCallNotificationChannelName: 'Incoming Call',
         isShowCallID: false,
       ),
       ios: IOSParams(
@@ -520,6 +648,11 @@ class NotificationService {
   }
 
   Future<void> endAllCalls() async {
+    if (_currentCallUuid != null) {
+      try {
+        await FlutterCallkitIncoming.endCall(_currentCallUuid!);
+      } catch (_) {}
+    }
     await FlutterCallkitIncoming.endAllCalls();
     _currentCallUuid = null;
   }
@@ -539,39 +672,6 @@ class NotificationService {
   );
 
   // ── Message notification (Android only) ───────────────────────
-
-  Future<void> showMessageNotification({
-    required int conversationId,
-    required String senderName,
-    required String message,
-    bool isGroup = false,
-    String? groupName,
-  }) async {
-    final title = isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
-    final body = message.isEmpty ? '📎 Media' : message;
-
-    // Android only — iOS handled natively by Firebase
-    if (Platform.isAndroid) {
-      final androidDetails = AndroidNotificationDetails(
-        'kore_messages',
-        'Messages',
-        channelDescription: 'New chat message notifications',
-        importance: Importance.high,
-        priority: Priority.high,
-        sound: const RawResourceAndroidNotificationSound('kore_message'),
-        styleInformation: BigTextStyleInformation(body),
-        groupKey: 'kore_chat_$conversationId',
-        autoCancel: true,
-      );
-      await _plugin.show(
-        conversationId,
-        title,
-        body,
-        NotificationDetails(android: androidDetails),
-        payload: 'chat_$conversationId',
-      );
-    }
-  }
 
   Future<void> cancelAll() async {
     await _plugin.cancelAll();

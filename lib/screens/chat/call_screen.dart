@@ -7,7 +7,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/notification_service.dart';
 import '../../socket/socket_events.dart';
 
-enum CallState { idle, calling, incoming, active, ended }
+enum CallState { idle, calling, ringing, incoming, active, ended }
 
 class CallScreen extends StatefulWidget {
   final int myUserId;
@@ -16,6 +16,9 @@ class CallScreen extends StatefulWidget {
   final String callType;
   final bool isOutgoing;
   final Map<String, dynamic>? incomingOffer;
+  final bool autoAnswer;
+  final int? roomId;
+  final int? conversationId;
 
   const CallScreen({
     super.key,
@@ -25,15 +28,16 @@ class CallScreen extends StatefulWidget {
     required this.callType,
     required this.isOutgoing,
     this.incomingOffer,
+    this.autoAnswer = false,
+    this.roomId,
+    this.conversationId,
   });
 
   @override
   State<CallScreen> createState() => _CallScreenState();
 }
 
-class _CallScreenState extends State<CallScreen>
-    with TickerProviderStateMixin {
-
+class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   // ── WebRTC ──────────────────────────────────────────────────────
   RTCPeerConnection? _pc;
   MediaStream? _localStream;
@@ -42,6 +46,8 @@ class _CallScreenState extends State<CallScreen>
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final List<RTCIceCandidate> _pendingCandidates = [];
   bool _remoteDescSet = false;
+  int? _roomId;
+  int? _conversationId;
 
   // ── State ───────────────────────────────────────────────────────
   CallState _callState = CallState.calling;
@@ -91,18 +97,21 @@ class _CallScreenState extends State<CallScreen>
 
     _pulse1 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-          parent: _pulseCtrl,
-          curve: const Interval(0.0, 0.7, curve: Curves.easeOut)),
+        parent: _pulseCtrl,
+        curve: const Interval(0.0, 0.7, curve: Curves.easeOut),
+      ),
     );
     _pulse2 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-          parent: _pulseCtrl,
-          curve: const Interval(0.2, 0.9, curve: Curves.easeOut)),
+        parent: _pulseCtrl,
+        curve: const Interval(0.2, 0.9, curve: Curves.easeOut),
+      ),
     );
     _pulse3 = Tween(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
-          parent: _pulseCtrl,
-          curve: const Interval(0.4, 1.0, curve: Curves.easeOut)),
+        parent: _pulseCtrl,
+        curve: const Interval(0.4, 1.0, curve: Curves.easeOut),
+      ),
     );
 
     _controlsFadeCtrl = AnimationController(
@@ -117,6 +126,8 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Future<void> _init() async {
+    _roomId = widget.roomId;
+    _conversationId = widget.conversationId;
     await _localRenderer.initialize();
     await _remoteRenderer.initialize();
     _registerSocketListeners();
@@ -125,6 +136,14 @@ class _CallScreenState extends State<CallScreen>
       await _startOutgoingCall();
     } else {
       setState(() => _callState = CallState.incoming);
+      // ← ADD: notify caller that we're ringing
+      try {
+        SocketEvents.emitCallRinging(toUserId: widget.remoteUserId);
+      } catch (_) {}
+      if (widget.autoAnswer && widget.incomingOffer != null) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        await _answerCall();
+      }
     }
   }
 
@@ -140,12 +159,23 @@ class _CallScreenState extends State<CallScreen>
     SocketEvents.offCallAnswered();
     SocketEvents.offCallEnded();
     SocketEvents.offIceCandidate();
+    SocketEvents.offCallRinging();
+    SocketEvents.offCallUnavailableWait();
+    SocketEvents.offCallRingingNow();
+    NotificationService().endAllCalls();
     super.dispose();
   }
 
   // ── Socket ──────────────────────────────────────────────────────
 
   void _registerSocketListeners() {
+    SocketEvents.onCallRinging((_) {
+      if (!mounted) return;
+      if (_callState == CallState.calling) {
+        setState(() => _callState = CallState.ringing);
+      }
+    });
+
     SocketEvents.onCallAnswered((data) async {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
@@ -172,34 +202,53 @@ class _CallScreenState extends State<CallScreen>
         _pendingCandidates.add(candidate);
       }
     });
+
+    SocketEvents.onCallUnavailableWait((data) {
+      if (!mounted) return;
+      final map = Map<String, dynamic>.from(data as Map);
+      if (map['roomId'] != null)
+        _roomId = int.tryParse(map['roomId'].toString());
+      if (map['conversationId'] != null)
+        _conversationId = int.tryParse(map['conversationId'].toString());
+    });
+
+    SocketEvents.onCallRingingNow((data) {
+      if (!mounted) return;
+      final map = Map<String, dynamic>.from(data as Map);
+      if (map['roomId'] != null)
+        _roomId = int.tryParse(map['roomId'].toString());
+      if (map['conversationId'] != null)
+        _conversationId = int.tryParse(map['conversationId'].toString());
+      if (_callState == CallState.calling) {
+        setState(() => _callState = CallState.ringing);
+      }
+    });
   }
 
   // ── WebRTC ──────────────────────────────────────────────────────
 
   Future<MediaStream> _getMedia() async {
-
-
     final constraints = _isVideo
         ? {
-      'audio': {
-        'echoCancellation': true,
-        'noiseSuppression': true,
-        'autoGainControl': true,
-      },
-      'video': {
-        'facingMode': 'user',
-        'width': {'ideal': 1280},
-        'height': {'ideal': 720},
-      },
-    }
+            'audio': {
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': true,
+            },
+            'video': {
+              'facingMode': 'user',
+              'width': {'ideal': 1280},
+              'height': {'ideal': 720},
+            },
+          }
         : {
-      'audio': {
-        'echoCancellation': true,
-        'noiseSuppression': true,
-        'autoGainControl': true,
-      },
-      'video': false,
-    };
+            'audio': {
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': true,
+            },
+            'video': false,
+          };
 
     return navigator.mediaDevices.getUserMedia(constraints);
   }
@@ -261,8 +310,6 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Future<void> _answerCall() async {
-
-    NotificationService().endCall();
     if (widget.incomingOffer == null) return;
     try {
       _localStream = await _getMedia();
@@ -275,7 +322,9 @@ class _CallScreenState extends State<CallScreen>
       );
       await pc.setRemoteDescription(offer);
       _remoteDescSet = true;
-      for (final c in _pendingCandidates) await pc.addCandidate(c);
+      for (final c in _pendingCandidates) {
+        await pc.addCandidate(c);
+      }
       _pendingCandidates.clear();
       final answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -283,9 +332,15 @@ class _CallScreenState extends State<CallScreen>
         toUserId: widget.remoteUserId,
         answer: {'type': answer.type, 'sdp': answer.sdp},
         callType: widget.callType,
+        roomId: _roomId,
+        conversationId: _conversationId,
       );
 
       _startTimer();
+      try {
+        await Helper.setSpeakerphoneOn(_isSpeakerOn);
+      } catch (_) {}
+
       if (mounted) setState(() => _callState = CallState.active);
     } catch (e) {
       debugPrint('Error answering: $e');
@@ -297,12 +352,16 @@ class _CallScreenState extends State<CallScreen>
     if (_pc == null) return;
 
     try {
-      await _pc!.setRemoteDescription(RTCSessionDescription(
-        answerMap['sdp'] as String,
-        answerMap['type'] as String,
-      ));
+      await _pc!.setRemoteDescription(
+        RTCSessionDescription(
+          answerMap['sdp'] as String,
+          answerMap['type'] as String,
+        ),
+      );
       _remoteDescSet = true;
-      for (final c in _pendingCandidates) await _pc!.addCandidate(c);
+      for (final c in _pendingCandidates) {
+        await _pc!.addCandidate(c);
+      }
       _pendingCandidates.clear();
       _startTimer();
       if (mounted) setState(() => _callState = CallState.active);
@@ -334,27 +393,53 @@ class _CallScreenState extends State<CallScreen>
   }
 
   void _hangup() {
-    NotificationService().endAllCalls(); // ← endAllCalls not just endCall
-    SocketEvents.emitEndCall(
-      toUserId: widget.remoteUserId,
-      fromUserId: widget.myUserId,
-      statusId: _callState == CallState.incoming ? 2 : 5,
-    );
+    final currentState = _callState;
+    if (currentState == CallState.ended) return;
+
+    final statusId = currentState == CallState.incoming
+        ? 2
+        : (currentState == CallState.calling ||
+              currentState == CallState.ringing)
+        ? 1
+        : 5;
+
+    // 1. End CallKit ring FIRST — this stops the ring on both sides
+    NotificationService().endAllCalls();
+
+    // 2. Tell other side
+    try {
+      SocketEvents.emitEndCall(
+        toUserId: widget.remoteUserId,
+        fromUserId: widget.myUserId,
+        statusId: statusId,
+        roomId: _roomId,
+        conversationId: _conversationId,
+      );
+    } catch (e) {
+      debugPrint('⚠️ emitEndCall error: $e');
+    }
+
+    // 3. Cleanup WebRTC
     _cleanupPC();
+
+    // 4. UI
     if (mounted) {
       setState(() => _callState = CallState.ended);
-      Future.delayed(const Duration(seconds: 1), () {
+      Future.delayed(const Duration(milliseconds: 800), () {
         if (mounted) Navigator.pop(context);
       });
     }
   }
 
   void _handleRemoteHangup() {
-    NotificationService().endAllCalls(); // ← endAllCalls not just endCall
+    if (_callState == CallState.ended) return; // guard double fire
+
+    NotificationService().endAllCalls();
     _cleanupPC();
+
     if (!mounted) return;
     setState(() => _callState = CallState.ended);
-    Future.delayed(const Duration(seconds: 2), () {
+    Future.delayed(const Duration(milliseconds: 800), () {
       if (mounted) Navigator.pop(context);
     });
   }
@@ -407,8 +492,8 @@ class _CallScreenState extends State<CallScreen>
   }
 
   String get _statusText => switch (_callState) {
-    CallState.incoming =>
-    'Incoming ${_isVideo ? 'video' : 'audio'} call',
+    CallState.ringing => 'Ringing…', // ← ADD
+    CallState.incoming => 'Incoming ${_isVideo ? 'video' : 'audio'} call',
     CallState.calling => 'Calling…',
     CallState.active => _elapsedLabel,
     CallState.ended => 'Call ended',
@@ -416,8 +501,7 @@ class _CallScreenState extends State<CallScreen>
   };
 
   String _initials(String name) {
-    final parts =
-    name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
     if (parts.length >= 2) return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
     if (parts.length == 1) return parts[0][0].toUpperCase();
     return '?';
@@ -425,9 +509,14 @@ class _CallScreenState extends State<CallScreen>
 
   Color _avatarColor(String name) {
     const colors = [
-      Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFEF5350),
-      Color(0xFFAB47BC), Color(0xFF42A5F5), Color(0xFFFF7043),
-      Color(0xFF66BB6A), Color(0xFFEC407A),
+      Color(0xFF5C6BC0),
+      Color(0xFF26A69A),
+      Color(0xFFEF5350),
+      Color(0xFFAB47BC),
+      Color(0xFF42A5F5),
+      Color(0xFFFF7043),
+      Color(0xFF66BB6A),
+      Color(0xFFEC407A),
     ];
     return colors[name.length % colors.length];
   }
@@ -436,10 +525,12 @@ class _CallScreenState extends State<CallScreen>
 
   @override
   Widget build(BuildContext context) {
-    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-    ));
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+      ),
+    );
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -471,7 +562,11 @@ class _CallScreenState extends State<CallScreen>
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
-                colors: [Color(0xFF0D0D1A), Color(0xFF1A0D2E), Color(0xFF0D1A1A)],
+                colors: [
+                  Color(0xFF0D0D1A),
+                  Color(0xFF1A0D2E),
+                  Color(0xFF0D1A1A),
+                ],
                 stops: [0.0, 0.5, 1.0],
               ),
             ),
@@ -479,9 +574,7 @@ class _CallScreenState extends State<CallScreen>
         ),
 
         // ── Subtle grid overlay ──
-        Positioned.fill(
-          child: CustomPaint(painter: _GridPainter()),
-        ),
+        Positioned.fill(child: CustomPaint(painter: _GridPainter())),
 
         // ── Avatar + name + status ──
         Positioned.fill(
@@ -599,7 +692,30 @@ class _CallScreenState extends State<CallScreen>
                         ),
                       ],
                     ),
-                  ] else if (isCalling) ...[
+                  ] else if (isCalling || _callState == CallState.ringing) ...[
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _RoundBtn(
+                          icon: _isMuted
+                              ? Icons.mic_off_rounded
+                              : Icons.mic_rounded,
+                          label: _isMuted ? 'Unmute' : 'Mute',
+                          active: !_isMuted,
+                          onTap: _toggleMute,
+                        ),
+                        const SizedBox(width: 24),
+                        _RoundBtn(
+                          icon: _isSpeakerOn
+                              ? Icons.volume_up_rounded
+                              : Icons.volume_off_rounded,
+                          label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
+                          active: _isSpeakerOn,
+                          onTap: _toggleSpeaker,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 32),
                     _EndBtn(onTap: _hangup, label: 'Cancel'),
                   ] else if (isEnded) ...[
                     const SizedBox(height: 16),
@@ -642,7 +758,7 @@ class _CallScreenState extends State<CallScreen>
             ),
           )
         else
-        // Pre-call background
+          // Pre-call background
           Positioned.fill(
             child: Container(
               decoration: const BoxDecoration(
@@ -738,7 +854,9 @@ class _CallScreenState extends State<CallScreen>
               child: SafeArea(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
-                      horizontal: 20, vertical: 12),
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
                   child: Row(
                     children: [
                       Expanded(
@@ -752,7 +870,7 @@ class _CallScreenState extends State<CallScreen>
                                 fontSize: 18,
                                 fontWeight: FontWeight.w700,
                                 shadows: [
-                                  Shadow(blurRadius: 8, color: Colors.black54)
+                                  Shadow(blurRadius: 8, color: Colors.black54),
                                 ],
                               ),
                             ),
@@ -787,10 +905,8 @@ class _CallScreenState extends State<CallScreen>
             child: GestureDetector(
               onPanUpdate: (d) {
                 setState(() {
-                  _pipX = (_pipX + d.delta.dx)
-                      .clamp(0.0, size.width - 96);
-                  _pipY = (_pipY + d.delta.dy)
-                      .clamp(0.0, size.height - 128);
+                  _pipX = (_pipX + d.delta.dx).clamp(0.0, size.width - 96);
+                  _pipY = (_pipY + d.delta.dy).clamp(0.0, size.height - 128);
                 });
               },
               child: Container(
@@ -799,7 +915,9 @@ class _CallScreenState extends State<CallScreen>
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(
-                      color: Colors.white.withOpacity(0.3), width: 1.5),
+                    color: Colors.white.withOpacity(0.3),
+                    width: 1.5,
+                  ),
                   boxShadow: [
                     BoxShadow(
                       color: Colors.black.withOpacity(0.4),
@@ -811,19 +929,21 @@ class _CallScreenState extends State<CallScreen>
                   borderRadius: BorderRadius.circular(15),
                   child: _isVideoOff
                       ? Container(
-                    color: const Color(0xFF1E1E2E),
-                    child: const Center(
-                      child: Icon(Icons.videocam_off_rounded,
-                          color: Colors.white38, size: 24),
-                    ),
-                  )
-                      :
-                  RTCVideoView(
-                    _localRenderer,
-                    mirror: _isFrontCamera,
-                    objectFit: RTCVideoViewObjectFit
-                        .RTCVideoViewObjectFitCover,
-                  ),
+                          color: const Color(0xFF1E1E2E),
+                          child: const Center(
+                            child: Icon(
+                              Icons.videocam_off_rounded,
+                              color: Colors.white38,
+                              size: 24,
+                            ),
+                          ),
+                        )
+                      : RTCVideoView(
+                          _localRenderer,
+                          mirror: _isFrontCamera,
+                          objectFit:
+                              RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                        ),
                 ),
               ),
             ),
@@ -835,16 +955,16 @@ class _CallScreenState extends State<CallScreen>
           left: 0,
           right: 0,
           child: FadeTransition(
-            opacity: isActive ? _controlsFade : const AlwaysStoppedAnimation(1.0),
+            opacity: isActive
+                ? _controlsFade
+                : const AlwaysStoppedAnimation(1.0),
             child: SafeArea(
               top: false,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
-                child:
-                isActive
+                child: isActive
                     ? _buildVideoActiveControls()
-                    :
-                isIncoming
+                    : isIncoming
                     ? _buildIncomingControls()
                     : _buildCallingControls(),
               ),
@@ -871,9 +991,7 @@ class _CallScreenState extends State<CallScreen>
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               _PillBtn(
-                icon: _isMuted
-                    ? Icons.mic_off_rounded
-                    : Icons.mic_rounded,
+                icon: _isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
                 label: _isMuted ? 'Unmute' : 'Mute',
                 active: !_isMuted,
                 onTap: _toggleMute,
@@ -895,7 +1013,6 @@ class _CallScreenState extends State<CallScreen>
                 onTap: _toggleSpeaker,
               ),
               Center(child: _EndBtn(onTap: _hangup)),
-
             ],
           ),
         ),
@@ -915,9 +1032,7 @@ class _CallScreenState extends State<CallScreen>
           onTap: _hangup,
         ),
         _ActionBtn(
-          icon: _isVideo
-              ? Icons.videocam_rounded
-              : Icons.call_rounded,
+          icon: _isVideo ? Icons.videocam_rounded : Icons.call_rounded,
           label: 'Answer',
           color: const Color(0xFF43A047),
           onTap: _answerCall,
@@ -927,7 +1042,39 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Widget _buildCallingControls() {
-    return Center(child: _EndBtn(onTap: _hangup, label: 'Cancel'));
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.45),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _PillBtn(
+                icon: _isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
+                label: _isMuted ? 'Unmute' : 'Mute',
+                active: !_isMuted,
+                onTap: _toggleMute,
+              ),
+              _PillBtn(
+                icon: _isSpeakerOn
+                    ? Icons.volume_up_rounded
+                    : Icons.volume_off_rounded,
+                label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
+                active: _isSpeakerOn,
+                onTap: _toggleSpeaker,
+              ),
+              _EndBtn(onTap: _hangup, label: 'Cancel'),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -983,7 +1130,8 @@ class _PulseAvatar extends StatelessWidget {
       child: Transform.scale(
         scale: 0.85 + anim.value * 0.65,
         child: Container(
-          width: s, height: s,
+          width: s,
+          height: s,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             border: Border.all(
@@ -1012,7 +1160,8 @@ class _StaticAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: size, height: size,
+      width: size,
+      height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: color,
@@ -1061,7 +1210,8 @@ class _PillBtn extends StatelessWidget {
         children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            width: 52, height: 52,
+            width: 52,
+            height: 52,
             decoration: BoxDecoration(
               color: active
                   ? Colors.white.withOpacity(0.15)
@@ -1073,16 +1223,17 @@ class _PillBtn extends StatelessWidget {
                     : Colors.white.withOpacity(0.1),
               ),
             ),
-            child: Icon(icon,
-                color: active ? Colors.white : Colors.white38, size: 22),
+            child: Icon(
+              icon,
+              color: active ? Colors.white : Colors.white38,
+              size: 22,
+            ),
           ),
           const SizedBox(height: 6),
           Text(
             label,
             style: TextStyle(
-              color: active
-                  ? Colors.white.withOpacity(0.85)
-                  : Colors.white38,
+              color: active ? Colors.white.withOpacity(0.85) : Colors.white38,
               fontSize: 10,
               fontWeight: FontWeight.w500,
             ),
@@ -1116,7 +1267,8 @@ class _RoundBtn extends StatelessWidget {
         children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            width: 60, height: 60,
+            width: 60,
+            height: 60,
             decoration: BoxDecoration(
               color: active
                   ? Colors.white.withOpacity(0.15)
@@ -1128,8 +1280,11 @@ class _RoundBtn extends StatelessWidget {
                     : Colors.white.withOpacity(0.1),
               ),
             ),
-            child: Icon(icon,
-                color: active ? Colors.white : Colors.white38, size: 24),
+            child: Icon(
+              icon,
+              color: active ? Colors.white : Colors.white38,
+              size: 24,
+            ),
           ),
           const SizedBox(height: 8),
           Text(
@@ -1161,7 +1316,8 @@ class _EndBtn extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 52, height: 52,
+            width: 52,
+            height: 52,
             decoration: const BoxDecoration(
               color: Color(0xFFE53935),
               shape: BoxShape.circle,
@@ -1173,8 +1329,11 @@ class _EndBtn extends StatelessWidget {
                 ),
               ],
             ),
-            child: const Icon(Icons.call_end_rounded,
-                color: Colors.white, size: 28),
+            child: const Icon(
+              Icons.call_end_rounded,
+              color: Colors.white,
+              size: 28,
+            ),
           ),
           const SizedBox(height: 8),
           Text(
@@ -1213,7 +1372,8 @@ class _ActionBtn extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 72, height: 72,
+            width: 72,
+            height: 72,
             decoration: BoxDecoration(
               color: color,
               shape: BoxShape.circle,
@@ -1258,7 +1418,8 @@ class _GlassBtn extends StatelessWidget {
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
           child: Container(
-            width: 44, height: 44,
+            width: 44,
+            height: 44,
             decoration: BoxDecoration(
               color: Colors.white.withOpacity(0.12),
               borderRadius: BorderRadius.circular(12),

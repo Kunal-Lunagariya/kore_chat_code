@@ -1,6 +1,7 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../../services/notification_service.dart';
+import '../../socket/socket_events.dart';
 import 'call_screen.dart';
 
 class IncomingCallOverlay extends StatefulWidget {
@@ -62,12 +63,20 @@ class _IncomingCallOverlayState extends State<IncomingCallOverlay>
   }
 
   void _decline() {
-    NotificationService().endCall();
+    // ← ADD: tell caller this was declined via socket
+    try {
+      SocketEvents.emitEndCall(
+        toUserId: widget.callerUserId,
+        fromUserId: widget.myUserId,
+        statusId: 2, // 2 = declined
+      );
+    } catch (e) {
+      debugPrint('⚠️ decline emitEndCall error: $e');
+    }
+    NotificationService().endAllCalls();
     NotificationService().stopForegroundRinging();
-
     _dismiss();
   }
-
   void _accept() {
     NotificationService().endCall();
     NotificationService().stopForegroundRinging();

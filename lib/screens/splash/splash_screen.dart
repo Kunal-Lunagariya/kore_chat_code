@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../services/api_call_service.dart';
@@ -26,9 +27,26 @@ class _SplashScreenState extends State<SplashScreen> {
     _checkLoginStatus();
   }
 
+  Future<void> _requestPermissions() async {
+    final results = await [
+      Permission.microphone,
+      Permission.camera,
+    ].request();
+
+    debugPrint('🎤 Mic: ${results[Permission.microphone]}');
+    debugPrint('📷 Cam: ${results[Permission.camera]}');
+
+    if (results[Permission.microphone]?.isPermanentlyDenied == true ||
+        results[Permission.camera]?.isPermanentlyDenied == true) {
+      debugPrint('⚠️ Permission permanently denied — user must enable in Settings');
+    }
+  }
+
   Future<void> _checkLoginStatus() async {
-    // Small delay for splash feel
     await Future.delayed(const Duration(milliseconds: 1200));
+
+    // ← ADD: request permissions before anything else
+    await _requestPermissions();
 
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString(_prefToken);
@@ -37,12 +55,9 @@ class _SplashScreenState extends State<SplashScreen> {
 
     if (token != null && token.isNotEmpty) {
       ApiCall.setAuthToken(token);
-
       final userId = prefs.getInt(_prefUserId) ?? 0;
       final userName = prefs.getString(_prefUserName) ?? '';
-
       SocketIndex.connectSocket(token, userId: userId);
-
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
@@ -112,7 +127,7 @@ class _SplashScreenState extends State<SplashScreen> {
                     ),
                   ),
                   const TextSpan(
-                    text: 'CHAT',
+                    text: 'CIRCLE',
                     style: TextStyle(
                       color: AppTheme.redAccent,
                       fontSize: 26,

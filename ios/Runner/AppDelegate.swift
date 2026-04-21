@@ -4,20 +4,24 @@ import PushKit
 import AVFoundation
 import FirebaseMessaging
 import flutter_callkit_incoming
+import CallKit
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, PKPushRegistryDelegate {
+@objc class AppDelegate: FlutterAppDelegate, PKPushRegistryDelegate, CXCallObserverDelegate {
+
+    private let callObserver = CXCallObserver()
 
     override func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         GeneratedPluginRegistrant.register(with: self)
-
-        // Register for APNs
         application.registerForRemoteNotifications()
 
-        // Register for VoIP push via PushKit
+        // Observe CallKit for audio session handoff
+        callObserver.setDelegate(self, queue: .main)
+
+        // Register VoIP push
         let voipRegistry = PKPushRegistry(queue: DispatchQueue.main)
         voipRegistry.delegate = self
         voipRegistry.desiredPushTypes = [PKPushType.voIP]
@@ -25,7 +29,37 @@ import flutter_callkit_incoming
         return super.application(application, didFinishLaunchingWithOptions: launchOptions)
     }
 
-    // ── APNs token — pass to Firebase manually ────────────────────
+    // ── CXCallObserver — activates audio when call connects ───────
+
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        print("📞 CXCall: connected=\(call.hasConnected) ended=\(call.hasEnded)")
+        if call.hasConnected && !call.hasEnded {
+            activateAudio()
+        }
+        if call.hasEnded {
+            deactivateAudio()
+        }
+    }
+
+    private func activateAudio() {
+        do {
+            let s = AVAudioSession.sharedInstance()
+            try s.setCategory(.playAndRecord, mode: .voiceChat,
+                options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
+            try s.setActive(true, options: .notifyOthersOnDeactivation)
+            print("✅ Audio activated")
+        } catch { print("⚠️ Audio activate error: \(error)") }
+    }
+
+    private func deactivateAudio() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(false,
+                options: .notifyOthersOnDeactivation)
+            print("✅ Audio deactivated")
+        } catch { print("⚠️ Audio deactivate error: \(error)") }
+    }
+
+    // ── APNs token ────────────────────────────────────────────────
 
     override func application(
         _ application: UIApplication,
@@ -33,75 +67,64 @@ import flutter_callkit_incoming
     ) {
         Messaging.messaging().apnsToken = deviceToken
         print("✅ APNs token set")
-        super.application(
-            application,
-            didRegisterForRemoteNotificationsWithDeviceToken: deviceToken
-        )
+        super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
     }
 
     override func application(
         _ application: UIApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        print("⚠️ APNs registration failed: \(error)")
+        print("⚠️ APNs failed: \(error)")
     }
 
     // ── PushKit: VoIP token ───────────────────────────────────────
 
-    func pushRegistry(
-        _ registry: PKPushRegistry,
-        didUpdate pushCredentials: PKPushCredentials,
-        for type: PKPushType
-    ) {
-        let token = pushCredentials.token
-            .map { String(format: "%02x", $0) }
-            .joined()
+    func pushRegistry(_ registry: PKPushRegistry,
+                      didUpdate pushCredentials: PKPushCredentials,
+                      for type: PKPushType) {
+        let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         print("📱 VoIP token: \(token)")
-        SwiftFlutterCallkitIncomingPlugin.sharedInstance?
-            .setDevicePushTokenVoIP(token)
+        SwiftFlutterCallkitIncomingPlugin.sharedInstance?.setDevicePushTokenVoIP(token)
     }
 
     // ── PushKit: incoming VoIP call ───────────────────────────────
 
-    func pushRegistry(
-        _ registry: PKPushRegistry,
-        didReceiveIncomingPushWith payload: PKPushPayload,
-        for type: PKPushType,
-        completion: @escaping () -> Void
-    ) {
+    func pushRegistry(_ registry: PKPushRegistry,
+                      didReceiveIncomingPushWith payload: PKPushPayload,
+                      for type: PKPushType,
+                      completion: @escaping () -> Void) {
+
         let p = payload.dictionaryPayload
+        print("📦 VoIP payload keys: \(p.keys)")
 
         guard
             let callerName  = p["callerName"]  as? String,
             let callType    = p["callType"]    as? String,
             let callerIdStr = p["callerId"]    as? String
         else {
+            print("⚠️ Missing required VoIP payload fields")
             completion()
             return
         }
 
-        let offerJson = p["offerJson"] as? String ?? ""
-        let uuid      = UUID().uuidString
-        let isVideo   = callType == "video"
+        // ← Backend sends 'offer' key — read both to be safe
+        let offerJson = (p["offerJson"] as? String)
+            ?? (p["offer"] as? String)
+            ?? ""
 
-        // Activate audio before showing CallKit
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(
-                .playAndRecord,
-                mode: .voiceChat,
-                options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
-            )
-            try session.setActive(true)
-        } catch {
-            print("⚠️ Audio error: \(error)")
-        }
+        print("📞 VoIP call from \(callerName), offerJson empty: \(offerJson.isEmpty)")
+
+        let uuid = UUID().uuidString
+        let isVideo = callType == "video"
+
+        // Activate audio before showing CallKit (required by Apple)
+        activateAudio()
 
         let callData = flutter_callkit_incoming.Data(
-            id:         uuid,
+            id: uuid,
             nameCaller: callerName,
-            handle:     callerName,
-            type:       isVideo ? 1 : 0
+            handle: callerName,
+            type: isVideo ? 1 : 0
         )
         callData.appName  = "Kore Circle"
         callData.duration = 45000
@@ -109,7 +132,7 @@ import flutter_callkit_incoming
             "callerId":   callerIdStr,
             "callerName": callerName,
             "callType":   callType,
-            "offerJson":  offerJson,
+            "offerJson":  offerJson,  // ← store as offerJson for Flutter to read
         ]
         callData.iconName                              = "AppIcon"
         callData.handleType                            = "generic"
@@ -132,12 +155,8 @@ import flutter_callkit_incoming
         completion()
     }
 
-    // ── PushKit: token invalidated ────────────────────────────────
-
-    func pushRegistry(
-        _ registry: PKPushRegistry,
-        didInvalidatePushTokenFor type: PKPushType
-    ) {
+    func pushRegistry(_ registry: PKPushRegistry,
+                      didInvalidatePushTokenFor type: PKPushType) {
         print("⚠️ VoIP token invalidated")
     }
 }

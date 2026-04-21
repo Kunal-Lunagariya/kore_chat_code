@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../services/api_call_service.dart';
 import '../../services/notification_service.dart';
@@ -9,6 +11,7 @@ import '../../socket/socket_events.dart';
 import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
 import '../chat/call_screen.dart';
+import '../chat/group_call_screen.dart';
 import '../chat/incoming_call_overlay.dart';
 import '../login/login_screen.dart';
 import '../chat/chat_screen.dart';
@@ -59,6 +62,7 @@ class RecentChat {
   final int? callId;
   final int? callType;
   final String? callStatus;
+  final List<Map<String, dynamic>> groupMembers;
 
   RecentChat({
     required this.conversationId,
@@ -86,6 +90,7 @@ class RecentChat {
     this.callId,
     this.callType,
     this.callStatus,
+    this.groupMembers = const [],
   });
 
   factory RecentChat.fromJson(Map<String, dynamic> json) {
@@ -119,6 +124,9 @@ class RecentChat {
       callId: (json['callId'] as num?)?.toInt(),
       callType: (json['callType'] as num?)?.toInt(),
       callStatus: json['callStatus'] as String?,
+      groupMembers: (json['groupMembers'] as List<dynamic>? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList(),
     );
   }
 
@@ -221,81 +229,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _isLoading = true;
   bool _hasError = false;
   Timer? _refreshTimer;
+  StreamSubscription? _callAcceptedSub;
+  bool _isNavigatingToCall = false;
 
   OverlayEntry? _callOverlayEntry;
 
-  StreamSubscription? _fcmCallSubscription;
+  final Set<int> _onlineUserIds = {};
 
-
-  void _showIncomingCallBanner({
-    required int fromUserId,
-    required String fromUserName,
-    required String callType,
-    required Map<String, dynamic> offer,
-  }) {
-    debugPrint('🎯 _showIncomingCallBanner called');
-    debugPrint('🎯 context mounted: $mounted');
-
-    _callOverlayEntry?.remove();
-    _callOverlayEntry = OverlayEntry(
-      builder: (_) => Positioned(
-        top: 0,
-        left: 0,
-        right: 0,
-        child: IncomingCallOverlay(
-          callerName: fromUserName,
-          callType: callType,
-          offer: offer,
-          myUserId: widget.userId,
-          callerUserId: fromUserId,
-          onDismiss: () {
-            _callOverlayEntry?.remove();
-            _callOverlayEntry = null;
-          },
-        ),
-      ),
-    );
-
-    try {
-      Overlay.of(context).insert(_callOverlayEntry!);
-      debugPrint('🎯 Overlay inserted successfully');
-    } catch (e) {
-      debugPrint('❌ Overlay insert error: $e');
-    }
-  }
-
+  @override
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    final isConnected = SocketIndex.isConnected;
-    debugPrint('🔌 Socket connected on HomeScreen init: $isConnected');
-    // Tell NotificationService our userId for CallKit accept navigation
     NotificationService().setMyUserId(widget.userId);
 
     _fetchRecentChats();
     _listenToNewMessages();
+    _registerCallListener();
 
     SocketIndex.setReconnectCallback(() {
-      debugPrint('🔁 Re-registering call listener after reconnect');
       if (mounted) _registerCallListener();
     });
 
-    _fcmCallSubscription = NotificationService.onForegroundCall.listen((data) {
+    // Listen for CallKit accept events (foreground / background)
+    _callAcceptedSub = NotificationService.onCallAccepted.listen((data) {
       if (!mounted) return;
-      if (Platform.isAndroid) {
-        final fromUserId = data['callerId'] as int? ?? 0;
-        final fromUserName = data['callerName'] as String? ?? 'Unknown';
-        final callType = data['callType'] as String? ?? 'audio';
-        final offer = data['offer'] as Map<String, dynamic>? ?? {};
-        _showIncomingCallBanner(
-          fromUserId: fromUserId,
-          fromUserName: fromUserName,
-          callType: callType,
-          offer: offer,
-        );
-      }
+      _handleCallKitAccepted(data);
+    });
+
+    // ── KEY FIX: Check if CallKit accept fired before HomeScreen built ──
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkPendingCallKitAccept();
     });
 
     try {
@@ -303,7 +268,139 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         debugPrint('📡 SOCKET EVENT: $event');
       });
     } catch (e) {}
+  }
 
+  // Add this new method:
+  Future<void> _checkPendingCallKitAccept() async {
+    if (_isNavigatingToCall) return;
+    try {
+      final calls = await FlutterCallkitIncoming.activeCalls();
+      if (calls == null || (calls as List).isEmpty) return;
+
+      // There's an active call — check if it was already accepted
+      // (i.e. we're in the accepted state, app just finished building)
+      debugPrint('📞 Found active CallKit call on HomeScreen build: $calls');
+
+      final call = (calls).first as Map;
+      final extra = Map<String, dynamic>.from(call['extra'] as Map? ?? {});
+
+      final offerStr =
+          extra['offerJson']?.toString() ?? extra['offer']?.toString() ?? '';
+      if (offerStr.isEmpty) return; // still ringing, not accepted yet
+
+      Map<String, dynamic> offer = {};
+      try {
+        offer = Map<String, dynamic>.from(jsonDecode(offerStr) as Map);
+      } catch (_) {
+        return;
+      }
+
+      final callerId = int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
+      final callerName = extra['callerName']?.toString() ?? 'Unknown';
+      final callType = extra['callType']?.toString() ?? 'audio';
+
+      if (callerId == 0 || offer.isEmpty) return;
+
+      if (_isNavigatingToCall) return;
+
+      // Only navigate if we're not already in a call screen
+      debugPrint('📞 Resuming pending accepted call from cold start');
+      await _handleCallKitAccepted({
+        'callerId': callerId,
+        'callerName': callerName,
+        'callType': callType,
+        'offer': offer,
+        'myUserId': widget.userId,
+      });
+    } catch (e) {
+      debugPrint('⚠️ _checkPendingCallKitAccept error: $e');
+    }
+  }
+
+  Future<void> _handleCallKitAccepted(Map<String, dynamic> data) async {
+    if (_isNavigatingToCall) {
+      debugPrint('⚠️ Already navigating to call — ignoring duplicate accept');
+      return;
+    }
+    _isNavigatingToCall = true;
+    final callerId = data['callerId'] as int;
+    final callerName = data['callerName'] as String;
+    final callType = data['callType'] as String;
+    final offer = Map<String, dynamic>.from(data['offer'] as Map);
+    final myUserId = data['myUserId'] as int;
+    final roomId = data['roomId'] as int?; // ← add
+    final conversationId = data['conversationId'] as int?; // ← add
+
+    await _ensureSocketConnected();
+    if (!mounted) return;
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CallScreen(
+          myUserId: myUserId,
+          remoteUserId: callerId,
+          remoteUserName: callerName,
+          callType: callType,
+          isOutgoing: false,
+          incomingOffer: offer,
+          autoAnswer: true,
+          roomId: roomId,
+          conversationId: conversationId,
+        ),
+      ),
+    ).then((_) {
+      _isNavigatingToCall = false;
+      NotificationService().clearPendingCall();
+      NotificationService().endAllCalls();
+    });
+  }
+
+  Future<void> _ensureSocketConnected() async {
+    try {
+      if (SocketIndex.isConnected) {
+        debugPrint('✅ Socket already connected');
+        return;
+      }
+
+      debugPrint('🔄 Socket not connected — connecting before call...');
+
+      try {
+        SocketIndex.getSocket();
+      } catch (e) {
+        // Not initialized — read token from prefs
+        final prefs = await SharedPreferences.getInstance();
+        final token = prefs.getString('auth_token');
+        final userId = prefs.getInt('user_id');
+        if (token != null) {
+          SocketIndex.connectSocket(token, userId: userId);
+        } else {
+          debugPrint('⚠️ No auth token — cannot connect socket');
+          return;
+        }
+      }
+
+      // Poll up to 8 seconds
+      const maxWaitMs = 8000;
+      const stepMs = 200;
+      int waited = 0;
+      while (!SocketIndex.isConnected && waited < maxWaitMs) {
+        await Future.delayed(const Duration(milliseconds: stepMs));
+        waited += stepMs;
+        debugPrint('⏳ Waiting for socket... ${waited}ms');
+      }
+
+      if (SocketIndex.isConnected) {
+        debugPrint('✅ Socket connected after ${waited}ms');
+        await Future.delayed(const Duration(milliseconds: 300));
+      } else {
+        debugPrint(
+          '⚠️ Socket not connected after ${waited}ms — proceeding anyway',
+        );
+      }
+    } catch (e) {
+      debugPrint('⚠️ _ensureSocketConnected error: $e');
+    }
   }
 
   void _registerCallListener() {
@@ -311,57 +408,111 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     SocketEvents.onIncomingCall((data) {
       if (!mounted) return;
+
+      // ← If we're already in a call, ignore new incoming_call socket events
+      if (_isNavigatingToCall) {
+        debugPrint('⚠️ Already in call — ignoring incoming_call socket event');
+        return;
+      }
+
       final map = Map<String, dynamic>.from(data as Map);
-      final fromUserId = (map['fromUserId'] as num?)?.toInt() ?? 0;
-      final fromUserName = (map['fromUserName'] as String?) ?? 'Unknown';
+      final fromUserId = (map['callerId'] as num?)?.toInt() ?? 0;
+      final fromUserName = (map['callerName'] as String?) ?? 'Unknown';
       final callType = (map['callType'] as String?) ?? 'audio';
-      final offer = Map<String, dynamic>.from(map['offer'] as Map? ?? {});
+      final messageId = map['messageId'] != null
+          ? int.tryParse(map['messageId'].toString())
+          : null;
+      final roomId = map['roomId'] != null
+          ? int.tryParse(map['roomId'].toString())
+          : null;
+      final conversationId = map['conversationId'] != null
+          ? int.tryParse(map['conversationId'].toString())
+          : null;
+
+      final offerRaw = map['offer'];
+      Map<String, dynamic> offer = {};
+      if (offerRaw is Map) {
+        offer = Map<String, dynamic>.from(offerRaw);
+      } else if (offerRaw is String && offerRaw.isNotEmpty) {
+        try {
+          offer = Map<String, dynamic>.from(jsonDecode(offerRaw) as Map);
+        } catch (_) {}
+      }
+
+      debugPrint(
+        '📞 incoming_call: fromUserId=$fromUserId fromUserName=$fromUserName',
+      );
 
       NotificationService().setPendingCall(
         callerId: fromUserId,
         callerName: fromUserName,
         callType: callType,
         offer: offer,
+        messageId: messageId,
+        roomId: roomId,
+        conversationId: conversationId,
       );
 
-      if (Platform.isIOS) {
-        // iOS: CallKit handles everything natively
-        NotificationService().showIncomingCall(
-          callerId: fromUserId,
-          callerName: fromUserName,
-          callType: callType,
-          offer: offer,
-        );
-      } else {
-        // Android: show in-app banner + CallKit notification
-        NotificationService().startForegroundRinging(
-          callerId: fromUserId,
-          callerName: fromUserName,
-          callType: callType,
-          offer: offer,
-        );
-        _showIncomingCallBanner(
-          fromUserId: fromUserId,
-          fromUserName: fromUserName,
-          callType: callType,
-          offer: offer,
-        );
-      }
+      NotificationService().showIncomingCall(
+        callerId: fromUserId,
+        callerName: fromUserName,
+        callType: callType,
+        offer: offer,
+      );
+    });
+
+    SocketEvents.onGroupCallIncoming((data) {
+      if (!mounted) return;
+      final map = Map<String, dynamic>.from(data as Map);
+      final conversationId = (map['conversationId'] as num?)?.toInt() ?? 0;
+      final callerId = (map['callerId'] as num?)?.toInt() ?? 0;
+      final callerName = (map['callerName'] as String?) ?? 'Unknown';
+      final callType = (map['callType'] as String?) ?? 'audio';
+
+      // Find the group chat from our chats list
+      final chat = _chats.firstWhere(
+        (c) => c.conversationId == conversationId,
+        orElse: () => _chats.first,
+      );
+
+      debugPrint(
+        '📞 Incoming group call from $callerName in conversation $conversationId',
+      );
+
+      // Show incoming call overlay / navigate
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => GroupCallScreen(
+            myUserId: widget.userId,
+            conversationId: conversationId,
+            groupName: chat.displayName,
+            callType: callType,
+            isInitiator: false,
+            groupMembers: chat.groupMembers,
+            callerId: callerId,
+            callerName: callerName,
+          ),
+        ),
+      );
     });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint('📱 App lifecycle: $state');
+
     if (state == AppLifecycleState.resumed) {
-      debugPrint('📱 App resumed — checking socket');
-      final isConnected = SocketIndex.isConnected;
-      debugPrint('🔌 Socket connected: $isConnected');
-      if (!isConnected) {
-        debugPrint('🔌 Reconnecting socket...');
-        SocketIndex.getSocket(); // triggers reconnect
+      if (!SocketIndex.isConnected) {
+        SocketIndex.getSocket();
       }
-      _registerCallListener(); // always re-register on resume
-      NotificationService().checkForMissedCallOnResume();
+      _registerCallListener();
+
+      // ← Don't check for missed calls if we just accepted one
+      if (!_isNavigatingToCall) {
+        NotificationService().checkForMissedCallOnResume();
+      }
+
       _fetchRecentChats(silent: true);
     }
   }
@@ -424,6 +575,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 fileType: msg['fileType'] as String?,
                 fileMimeType: msg['fileMimeType'] as String?,
                 fileName: msg['fileName'] as String?,
+                groupMembers: old.groupMembers,
               );
 
               _chats.removeAt(idx);
@@ -450,80 +602,104 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           }
         } catch (_) {}
       });
-      SocketEvents.onUserOnline((data) {
+
+      SocketEvents.onUserStatus((data) {
         if (!mounted) return;
         final map = Map<String, dynamic>.from(data as Map);
         final userId = (map['userId'] as num?)?.toInt() ?? 0;
-        setState(() {
-          _chats = _chats.map((c) {
-            if (c.themUserId == userId) {
-              return RecentChat(
-                conversationId: c.conversationId,
-                myIsMuted: c.myIsMuted,
-                themUserId: c.themUserId,
-                themUserName: c.themUserName,
-                themUserRole: c.themUserRole,
-                themIsOnline: true, // ← updated
-                groupName: c.groupName,
-                conversationType: c.conversationType,
-                createdBy: c.createdBy,
-                createdByName: c.createdByName,
-                createdAt: c.createdAt,
-                lastMessageId: c.lastMessageId,
-                lastMessageTime: c.lastMessageTime,
-                lastMessageText: c.lastMessageText,
-                lastMessageSenderId: c.lastMessageSenderId,
-                lastMessageType: c.lastMessageType,
-                lastMessageMediaId: c.lastMessageMediaId,
-                unRead: c.unRead,
-                fileUrl: c.fileUrl,
-                fileType: c.fileType,
-                fileMimeType: c.fileMimeType,
-                fileName: c.fileName,
-              );
-            }
-            return c;
-          }).toList();
-        });
+        final isOnline = map['isOnline'] == 1 || map['isOnline'] == true;
+        _updateUserOnlineStatus(userId, isOnline);
       });
 
-      SocketEvents.onUserOffline((data) {
+      // Handles initial list of online users when app connects
+      SocketEvents.onOnlineUsers((data) {
+        if (!mounted) return;
+        final ids = (data as List<dynamic>)
+            .map((e) => (e as num?)?.toInt() ?? 0)
+            .where((id) => id > 0)
+            .toSet();
+        setState(() {
+          _onlineUserIds
+            ..clear()
+            ..addAll(ids);
+          // Apply to current chats
+          _chats = _chats
+              .map(
+                (c) => _rebuildChat(
+                  c,
+                  themIsOnline: _onlineUserIds.contains(c.themUserId),
+                ),
+              )
+              .toList();
+        });
+        debugPrint('👥 Online users: $_onlineUserIds');
+      });
+
+      SocketEvents.onUserStatus((data) {
         if (!mounted) return;
         final map = Map<String, dynamic>.from(data as Map);
         final userId = (map['userId'] as num?)?.toInt() ?? 0;
+        final isOnline = map['isOnline'] == 1 || map['isOnline'] == true;
+
         setState(() {
+          if (isOnline) {
+            _onlineUserIds.add(userId);
+          } else {
+            _onlineUserIds.remove(userId);
+          }
+          // Update the specific chat's online status
           _chats = _chats.map((c) {
             if (c.themUserId == userId) {
-              return RecentChat(
-                conversationId: c.conversationId,
-                myIsMuted: c.myIsMuted,
-                themUserId: c.themUserId,
-                themUserName: c.themUserName,
-                themUserRole: c.themUserRole,
-                themIsOnline: false, // ← updated
-                groupName: c.groupName,
-                conversationType: c.conversationType,
-                createdBy: c.createdBy,
-                createdByName: c.createdByName,
-                createdAt: c.createdAt,
-                lastMessageId: c.lastMessageId,
-                lastMessageTime: c.lastMessageTime,
-                lastMessageText: c.lastMessageText,
-                lastMessageSenderId: c.lastMessageSenderId,
-                lastMessageType: c.lastMessageType,
-                lastMessageMediaId: c.lastMessageMediaId,
-                unRead: c.unRead,
-                fileUrl: c.fileUrl,
-                fileType: c.fileType,
-                fileMimeType: c.fileMimeType,
-                fileName: c.fileName,
-              );
+              return _rebuildChat(c, themIsOnline: isOnline);
             }
             return c;
           }).toList();
         });
+        debugPrint('📡 user_status: userId=$userId isOnline=$isOnline');
       });
     } catch (_) {}
+  }
+
+  void _updateUserOnlineStatus(int userId, bool isOnline) {
+    setState(() {
+      _chats = _chats.map((c) {
+        if (c.themUserId == userId) {
+          return _rebuildChat(c, themIsOnline: isOnline);
+        }
+        return c;
+      }).toList();
+    });
+  }
+
+  RecentChat _rebuildChat(RecentChat c, {required bool themIsOnline}) {
+    return RecentChat(
+      conversationId: c.conversationId,
+      myIsMuted: c.myIsMuted,
+      themUserId: c.themUserId,
+      themUserName: c.themUserName,
+      themUserRole: c.themUserRole,
+      themIsOnline: themIsOnline,
+      groupName: c.groupName,
+      conversationType: c.conversationType,
+      createdBy: c.createdBy,
+      createdByName: c.createdByName,
+      createdAt: c.createdAt,
+      lastMessageId: c.lastMessageId,
+      lastMessageTime: c.lastMessageTime,
+      lastMessageText: c.lastMessageText,
+      lastMessageSenderId: c.lastMessageSenderId,
+      lastMessageType: c.lastMessageType,
+      lastMessageMediaId: c.lastMessageMediaId,
+      unRead: c.unRead,
+      fileUrl: c.fileUrl,
+      fileType: c.fileType,
+      fileMimeType: c.fileMimeType,
+      fileName: c.fileName,
+      callId: c.callId,
+      callType: c.callType,
+      callStatus: c.callStatus,
+      groupMembers: c.groupMembers,
+    );
   }
 
   @override
@@ -533,15 +709,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _searchController.dispose();
     _callOverlayEntry?.remove();
     _callOverlayEntry = null;
-    _fcmCallSubscription?.cancel();
-
+    _callAcceptedSub?.cancel();
 
     try {
       final socket = SocketIndex.getSocket();
       socket.off('recent_chat_update');
       socket.off('incoming_call');
-      socket.off('user_online');
-      socket.off('user_offline');
+      socket.off('user_status');
+      socket.off('online_users');
+      SocketEvents.offGroupCallIncoming();
     } catch (_) {}
 
     super.dispose();
@@ -564,13 +740,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final chats = data
             .map((e) => RecentChat.fromJson(e as Map<String, dynamic>))
             .toList();
+
         setState(() {
-          _chats = chats;
+          // ← Preserve socket-tracked online status — API always returns null
+          _chats = chats
+              .map(
+                (c) => _rebuildChat(
+                  c,
+                  themIsOnline: _onlineUserIds.contains(c.themUserId),
+                ),
+              )
+              .toList();
           _isLoading = false;
           _hasError = false;
         });
 
-        // ← Emit delivered for all unread on load
         SocketEvents.emitMultiMessageStatusDelivered(receiverId: widget.userId);
       } else {
         setState(() {
@@ -598,6 +782,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _logout() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final userId = prefs.getInt('user_id') ?? 0;
+      if (userId > 0) {
+        await ApiCall.post(
+          'v1/user/user-device',
+          data: {
+            'userId': userId,
+            'deviceType': Platform.isIOS ? 'ios' : 'android',
+            'fcmToken': null,
+            'voIpToken': null,
+          },
+        );
+      }
+    } catch (e) {
+      debugPrint('⚠️ Failed to clear device token: $e');
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auth_token');
     await prefs.remove('user_id');
@@ -622,6 +824,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       builder: (_) => _NewChatModal(
         currentUserId: widget.userId,
         myUserId: widget.userId,
+        onlineUserIds: _onlineUserIds,
         onChatOpened: (conversationId, themUserId, themUserName, themIsOnline) {
           setState(() => _openConversationId = conversationId);
           Navigator.push(
@@ -633,6 +836,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 themUserName: themUserName,
                 themIsOnline: themIsOnline,
                 myUserId: widget.userId,
+                onlineUserIds: _onlineUserIds,
+                isGroup: themUserId == 0,
+                groupMembers: const [],
               ),
             ),
           ).then((_) async {
@@ -676,34 +882,58 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           padding: const EdgeInsets.fromLTRB(20, 12, 16, 14),
           child: Row(
             children: [
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [AppTheme.redAccent, AppTheme.redDark],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppTheme.redAccent.withOpacity(0.3),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
+              Stack(
+                children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [AppTheme.redAccent, AppTheme.redDark],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: AppTheme.redAccent.withOpacity(0.3),
+                          blurRadius: 10,
+                          offset: const Offset(0, 3),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-                child: Center(
-                  child: Text(
-                    _initials(widget.userName),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 15,
+                    child: Center(
+                      child: Text(
+                        _initials(widget.userName),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                  Positioned(
+                    bottom: 1,
+                    right: 1,
+                    child: Container(
+                      width: 13,
+                      height: 13,
+                      decoration: BoxDecoration(
+                        color: _onlineUserIds.contains(widget.userId)
+                            ? Color(0xFF4CAF50)
+                            : Colors.red,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: isDark
+                              ? AppTheme.darkCard
+                              : AppTheme.lightCard,
+                          width: 2,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -1055,6 +1285,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   fileType: old.fileType,
                   fileMimeType: old.fileMimeType,
                   fileName: old.fileName,
+                  groupMembers: old.groupMembers,
                 );
               }
             });
@@ -1067,6 +1298,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   themUserName: chat.displayName,
                   themIsOnline: chat.themIsOnline,
                   myUserId: widget.userId,
+                  onlineUserIds: _onlineUserIds,
+                  isGroup: chat.conversationType == 2,
+                  groupMembers: chat.groupMembers,
                 ),
               ),
             );
@@ -1320,6 +1554,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 class _NewChatModal extends StatefulWidget {
   final int currentUserId;
   final int myUserId;
+  final Set<int> onlineUserIds;
   final void Function(
     int conversationId,
     int themUserId,
@@ -1331,6 +1566,7 @@ class _NewChatModal extends StatefulWidget {
   const _NewChatModal({
     required this.currentUserId,
     required this.myUserId,
+    required this.onlineUserIds,
     required this.onChatOpened,
   });
 
@@ -1635,7 +1871,7 @@ class _NewChatModalState extends State<_NewChatModal> {
 
   void _showGroupNameDialog() {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final TextEditingController _groupNameCtrl = TextEditingController();
+    final TextEditingController groupNameCtrl = TextEditingController();
 
     showDialog(
       context: context,
@@ -1676,7 +1912,7 @@ class _NewChatModalState extends State<_NewChatModal> {
                 ),
               ),
               child: TextField(
-                controller: _groupNameCtrl,
+                controller: groupNameCtrl,
                 autofocus: true,
                 style: TextStyle(
                   color: isDark
@@ -1739,7 +1975,7 @@ class _NewChatModalState extends State<_NewChatModal> {
                     onPressed: _starting
                         ? null
                         : () async {
-                            final name = _groupNameCtrl.text.trim();
+                            final name = groupNameCtrl.text.trim();
                             if (name.isEmpty) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
@@ -2019,8 +2255,9 @@ class _NewChatModalState extends State<_NewChatModal> {
   }
 
   Widget _buildSelectedChips(bool isDark) {
-    if (!_isMultiSelect || _selectedUsers.isEmpty)
+    if (!_isMultiSelect || _selectedUsers.isEmpty) {
       return const SizedBox.shrink();
+    }
     return SizedBox(
       height: 44,
       child: ListView.separated(

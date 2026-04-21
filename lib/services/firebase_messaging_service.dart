@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
 import 'package:flutter_callkit_incoming/entities/entities.dart';
@@ -11,10 +10,13 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   final type = data['type'] ?? 'message';
 
   if (type == 'call') {
+    await FlutterCallkitIncoming.endAllCalls();
+
     final uuid = const Uuid().v4();
     final callerName = data['callerName'] ?? 'Unknown';
     final callType = data['callType'] ?? 'audio';
     final callerId = data['callerId'] ?? '0';
+    // ← Backend sends 'offer' not 'offerJson' — fix this
     final offerJson = data['offerJson'] ?? data['offer'] ?? '';
 
     final params = CallKitParams(
@@ -29,16 +31,16 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
         'callerId': callerId,
         'callerName': callerName,
         'callType': callType,
-        'offerJson': offerJson,
+        'offerJson': offerJson, // ← store as offerJson internally
       },
       android: AndroidParams(
-        isCustomNotification: true,
+        isCustomNotification: false,
         isShowLogo: false,
         ringtonePath: 'system_ringtone_default',
-        backgroundColor: '#1E1E2E',
-        actionColor: '#7C3AED',
-        textColor: '#FFFFFF',
-        incomingCallNotificationChannelName: 'Incoming Calls',
+        backgroundColor: '#0955FA',
+        actionColor: '#4CAF50',
+        textColor: '#ffffff',
+        incomingCallNotificationChannelName: 'Incoming Call',
         missedCallNotificationChannelName: 'Missed Calls',
         isShowCallID: false,
       ),
@@ -61,55 +63,53 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     );
 
     await FlutterCallkitIncoming.showCallkitIncoming(params);
-  } else {
-    // Android only — iOS shows natively via Firebase
-    if (message.notification != null) return;
+    return;
+  }
 
-    final plugin = FlutterLocalNotificationsPlugin();
-    const androidSettings = AndroidInitializationSettings(
-      '@mipmap/ic_launcher',
-    );
-    await plugin.initialize(
-      const InitializationSettings(android: androidSettings),
-    );
+  // Message — only handle data-only (no notification block)
+  if (message.notification != null) return;
 
-    final androidImpl = plugin
-        .resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin
-        >();
-    await androidImpl?.createNotificationChannel(
-      const AndroidNotificationChannel(
+  final plugin = FlutterLocalNotificationsPlugin();
+  const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+  await plugin.initialize(
+    const InitializationSettings(android: androidSettings),
+  );
+
+  final androidImpl = plugin
+      .resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin
+      >();
+  await androidImpl?.createNotificationChannel(
+    const AndroidNotificationChannel(
+      'kore_messages',
+      'Messages',
+      importance: Importance.high,
+      enableVibration: true,
+    ),
+  );
+
+  final senderName = data['senderName'] ?? 'New Message';
+  final messageText = data['message'] ?? '';
+  final conversationId = int.tryParse(data['conversationId'] ?? '0') ?? 0;
+  final isGroup = data['isGroup'] == 'true';
+  final groupName = data['groupName'] as String?;
+  final title = isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
+
+  if (messageText.isEmpty && senderName == 'New Message') return;
+
+  await plugin.show(
+    conversationId,
+    title,
+    messageText.isEmpty ? '📎 Attachment' : messageText,
+    const NotificationDetails(
+      android: AndroidNotificationDetails(
         'kore_messages',
         'Messages',
         importance: Importance.high,
-        sound: RawResourceAndroidNotificationSound('kore_message'),
-        playSound: true,
-        enableVibration: true,
+        priority: Priority.high,
+        autoCancel: true,
       ),
-    );
-
-    final senderName = data['senderName'] ?? 'New Message';
-    final messageText = data['message'] ?? '';
-    final conversationId = int.tryParse(data['conversationId'] ?? '0') ?? 0;
-    final isGroup = data['isGroup'] == 'true';
-    final groupName = data['groupName'] as String?;
-    final title = isGroup ? '${groupName ?? 'Group'}: $senderName' : senderName;
-
-    await plugin.show(
-      conversationId,
-      title,
-      messageText.isEmpty ? '📎 Media' : messageText,
-      NotificationDetails(
-        android: AndroidNotificationDetails(
-          'kore_messages',
-          'Messages',
-          importance: Importance.high,
-          priority: Priority.high,
-          sound: const RawResourceAndroidNotificationSound('kore_message'),
-          autoCancel: true,
-        ),
-      ),
-      payload: 'chat_$conversationId',
-    );
-  }
+    ),
+    payload: 'chat_$conversationId',
+  );
 }

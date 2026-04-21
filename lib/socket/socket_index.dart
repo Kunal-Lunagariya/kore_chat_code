@@ -1,5 +1,4 @@
-import 'dart:ui';
-
+import 'package:flutter/cupertino.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 class SocketIndex {
@@ -12,7 +11,6 @@ class SocketIndex {
   static void setReconnectCallback(VoidCallback callback) {
     _onReconnectCallback = callback;
   }
-
 
   static void setActiveConversation(String? id) {
     _activeConversationId = id;
@@ -34,7 +32,6 @@ class SocketIndex {
       return _socket!;
     }
 
-    // Fresh connect
     _socket = IO.io(
       'https://chatapi.koremobiles.in',
       IO.OptionBuilder()
@@ -43,10 +40,10 @@ class SocketIndex {
           .disableAutoConnect()
           .enableReconnection()
           .setReconnectionAttempts(double.infinity)
-          .setReconnectionDelay(1000)
-          .setReconnectionDelayMax(5000)
-          .setRandomizationFactor(0.5)
-          .setTimeout(10000)
+          .setReconnectionDelay(500)
+          .setReconnectionDelayMax(3000)
+          .setRandomizationFactor(0.2)
+          .setTimeout(8000)
           .build(),
     );
 
@@ -73,7 +70,6 @@ class SocketIndex {
       if (_userId != null) {
         _socket!.emit('user_online', {'userId': _userId});
       }
-      // Re-register all listeners via callback
       _onReconnectCallback?.call();
     });
 
@@ -99,6 +95,7 @@ class SocketIndex {
       throw Exception('Socket not initialized. Call connectSocket() first.');
     }
     if (!_socket!.connected) {
+      debugPrint('🔄 Socket not connected — forcing reconnect');
       _socket!.connect();
     }
     return _socket!;

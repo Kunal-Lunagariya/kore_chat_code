@@ -269,8 +269,9 @@ class ApiCall {
         ..badCertificateCallback = (cert, host, port) => true;
       final client = IOClient(ioClient);
       var request = http.MultipartRequest('POST', url);
-      if (_authToken != null)
+      if (_authToken != null) {
         request.headers['Authorization'] = 'Bearer $_authToken';
+      }
       request.headers['appname'] = appName;
       request.headers['appversion'] = appVersion ?? '1.0.0';
       request.headers['X-Tunnel-Skip-Browser-Warning'] = 'true';
@@ -311,8 +312,9 @@ class ApiCall {
       return _handleResponse(response);
     } else {
       var request = http.MultipartRequest('POST', url);
-      if (_authToken != null)
+      if (_authToken != null) {
         request.headers['Authorization'] = 'Bearer $_authToken';
+      }
       request.headers['appname'] = appName;
       request.headers['appversion'] = appVersion ?? '1.0.0';
       if (headers != null) {

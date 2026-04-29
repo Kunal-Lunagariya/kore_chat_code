@@ -13,7 +13,6 @@ import '../../services/api_call_service.dart';
 import '../../socket/socket_events.dart';
 import '../../theme/app_theme.dart';
 import 'package:audioplayers/audioplayers.dart';
-import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -70,8 +69,9 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _pendingAudioPath;
   String? _pendingDocPath;
   String? _pendingDocName;
-  List<Map<String, dynamic>> _groupMembers = [];
-  bool _loadingMembers = false;
+  // Mutable local copy of group members — updated after add/remove
+  List<Map<String, dynamic>> _localMembers = [];
+  bool _memberActionLoading = false;
 
   // Pagination
   int _page = 1;
@@ -89,9 +89,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool get _isOnline => widget.onlineUserIds.contains(widget.themUserId);
 
+  bool get _isAdmin => _localMembers.any(
+    (m) =>
+        (m['userId'] as num?)?.toInt() == widget.myUserId &&
+        (m['role'] as String?) == 'Admin',
+  );
+
   @override
   void initState() {
     super.initState();
+    _localMembers = List<Map<String, dynamic>>.from(widget.groupMembers);
     _fetchMessages();
     _scrollCtrl.addListener(_onScroll);
     _messageCtrl.addListener(() {
@@ -238,11 +245,12 @@ class _ChatScreenState extends State<ChatScreen> {
   // ── API ────────────────────────────────────
 
   Future<void> _fetchMessages() async {
-    if (mounted)
+    if (mounted) {
       setState(() {
         _isLoading = true;
         _hasError = false;
       });
+    }
     try {
       final response = await ApiCall.get(
         'v1/chat/messages',
@@ -272,11 +280,12 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       }
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _isLoading = false;
           _hasError = true;
         });
+      }
     }
   }
 
@@ -1133,8 +1142,9 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted)
+      if (mounted) {
         setState(() => _recordDuration += const Duration(seconds: 1));
+      }
     });
   }
 
@@ -1392,33 +1402,31 @@ class _ChatScreenState extends State<ChatScreen> {
                     ],
                   ),
                 ),
-                // Call buttons — 1-to-1 only
-                if (!widget.isGroup) ...[
-                  IconButton(
-                    onPressed: () => widget.isGroup
-                        ? _startGroupCall('audio')
-                        : _startCall('audio'),
-                    icon: Icon(
-                      Icons.call_rounded,
-                      size: 22,
-                      color: isDark
-                          ? AppTheme.darkTextSecondary
-                          : AppTheme.lightTextSecondary,
-                    ),
+                // Call buttons
+                IconButton(
+                  onPressed: () => widget.isGroup
+                      ? _startGroupCall('audio')
+                      : _startCall('audio'),
+                  icon: Icon(
+                    Icons.call_rounded,
+                    size: 22,
+                    color: isDark
+                        ? AppTheme.darkTextSecondary
+                        : AppTheme.lightTextSecondary,
                   ),
-                  IconButton(
-                    onPressed: () => widget.isGroup
-                        ? _startGroupCall('video')
-                        : _startCall('video'),
-                    icon: Icon(
-                      Icons.videocam_rounded,
-                      size: 24,
-                      color: isDark
-                          ? AppTheme.darkTextSecondary
-                          : AppTheme.lightTextSecondary,
-                    ),
+                ),
+                IconButton(
+                  onPressed: () => widget.isGroup
+                      ? _startGroupCall('video')
+                      : _startCall('video'),
+                  icon: Icon(
+                    Icons.videocam_rounded,
+                    size: 24,
+                    color: isDark
+                        ? AppTheme.darkTextSecondary
+                        : AppTheme.lightTextSecondary,
                   ),
-                ],
+                ),
               ],
             ),
           ),
@@ -1770,142 +1778,571 @@ class _ChatScreenState extends State<ChatScreen> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => DraggableScrollableSheet(
-        initialChildSize: 0.55,
-        minChildSize: 0.35,
-        maxChildSize: 0.9,
-        builder: (_, scrollCtrl) => Container(
-          decoration: BoxDecoration(
-            color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
-            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-          ),
-          child: Column(
-            children: [
-              Container(
-                margin: const EdgeInsets.only(top: 12, bottom: 20),
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? Colors.white.withOpacity(0.15)
-                      : Colors.black.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(2),
-                ),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setSheetState) => DraggableScrollableSheet(
+          initialChildSize: 0.55,
+          minChildSize: 0.35,
+          maxChildSize: 0.9,
+          builder: (_, scrollCtrl) => Container(
+            decoration: BoxDecoration(
+              color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(24),
               ),
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  color: _avatarColor(widget.themUserName),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.group_rounded,
-                  color: Colors.white,
-                  size: 30,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                widget.themUserName,
-                style: TextStyle(
-                  color: isDark
-                      ? AppTheme.darkTextPrimary
-                      : AppTheme.lightTextPrimary,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '${widget.groupMembers.length} members',
-                style: TextStyle(
-                  color: isDark
-                      ? AppTheme.darkTextSecondary
-                      : AppTheme.lightTextSecondary,
-                  fontSize: 13,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Divider(
-                color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
-                height: 1,
-              ),
-              Expanded(
-                child: ListView.builder(
-                  controller: scrollCtrl,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
+            ),
+            child: Column(
+              children: [
+                // Drag handle
+                Container(
+                  margin: const EdgeInsets.only(top: 12, bottom: 16),
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Colors.white.withOpacity(0.15)
+                        : Colors.black.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(2),
                   ),
-                  itemCount: widget.groupMembers.length,
-                  itemBuilder: (_, i) {
-                    final m = widget.groupMembers[i];
-                    // API returns 'UserName' (capital U N)
-                    final name =
-                        (m['UserName'] as String?) ??
-                        (m['userName'] as String?) ??
-                        'Unknown';
-                    final userId = (m['userId'] as num?)?.toInt() ?? 0;
-                    final role = (m['role'] as String?) ?? 'Member';
-                    final isMe = userId == widget.myUserId;
-
-                    return ListTile(
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 2,
-                      ),
-                      leading: Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: _avatarColor(name),
-                          shape: BoxShape.circle,
+                ),
+                // Group avatar + name
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: _avatarColor(widget.themUserName),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.group_rounded,
+                    color: Colors.white,
+                    size: 30,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  widget.themUserName,
+                  style: TextStyle(
+                    color: isDark
+                        ? AppTheme.darkTextPrimary
+                        : AppTheme.lightTextPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${_localMembers.length} members',
+                  style: TextStyle(
+                    color: isDark
+                        ? AppTheme.darkTextSecondary
+                        : AppTheme.lightTextSecondary,
+                    fontSize: 13,
+                  ),
+                ),
+                // Add member button (admin only)
+                if (_isAdmin) ...[
+                  const SizedBox(height: 12),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: () =>
+                            _showAddMembersSheet(ctx, setSheetState, isDark),
+                        icon: const Icon(Icons.person_add_rounded, size: 18),
+                        label: const Text('Add Members'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF7C3AED),
+                          side: const BorderSide(color: Color(0xFF7C3AED)),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 10),
                         ),
-                        child: Center(
-                          child: Text(
-                            _initials(name),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w700,
-                              fontSize: 15,
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Divider(
+                  color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
+                  height: 1,
+                ),
+                // Members list
+                Expanded(
+                  child: ListView.builder(
+                    controller: scrollCtrl,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    itemCount: _localMembers.length,
+                    itemBuilder: (_, i) {
+                      final m = _localMembers[i];
+                      final name =
+                          (m['UserName'] as String?) ??
+                          (m['userName'] as String?) ??
+                          'Unknown';
+                      final userId = (m['userId'] as num?)?.toInt() ?? 0;
+                      final role = (m['role'] as String?) ?? 'Member';
+                      final isMe = userId == widget.myUserId;
+
+                      return ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 2,
+                        ),
+                        leading: Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: _avatarColor(name),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Center(
+                            child: Text(
+                              _initials(name),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 15,
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                      title: Text(
-                        isMe ? '$name (You)' : name,
-                        style: TextStyle(
-                          color: isDark
-                              ? AppTheme.darkTextPrimary
-                              : AppTheme.lightTextPrimary,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
+                        title: Text(
+                          isMe ? '$name (You)' : name,
+                          style: TextStyle(
+                            color: isDark
+                                ? AppTheme.darkTextPrimary
+                                : AppTheme.lightTextPrimary,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                      subtitle: Text(
-                        role,
-                        style: TextStyle(
-                          color: role == 'Admin'
-                              ? const Color(0xFF7C3AED)
-                              : (isDark
-                                    ? AppTheme.darkTextSecondary
-                                    : AppTheme.lightTextSecondary),
-                          fontSize: 12,
-                          fontWeight: role == 'Admin'
-                              ? FontWeight.w600
-                              : FontWeight.normal,
+                        subtitle: Text(
+                          role,
+                          style: TextStyle(
+                            color: role == 'Admin'
+                                ? const Color(0xFF7C3AED)
+                                : (isDark
+                                      ? AppTheme.darkTextSecondary
+                                      : AppTheme.lightTextSecondary),
+                            fontSize: 12,
+                            fontWeight: role == 'Admin'
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                          ),
                         ),
-                      ),
-                    );
-                  },
+                        // Remove button: admin only, not for self, not for other admins
+                        trailing: _isAdmin && !isMe && role != 'Admin'
+                            ? IconButton(
+                                icon: const Icon(
+                                  Icons.remove_circle_outline_rounded,
+                                  color: Color(0xFFE53935),
+                                  size: 22,
+                                ),
+                                tooltip: 'Remove from group',
+                                onPressed: _memberActionLoading
+                                    ? null
+                                    : () => _removeMember(
+                                        userId,
+                                        name,
+                                        setSheetState,
+                                        isDark,
+                                      ),
+                              )
+                            : null,
+                      );
+                    },
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _removeMember(
+    int userId,
+    String name,
+    void Function(void Function()) setSheetState,
+    bool isDark,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          'Remove Member',
+          style: TextStyle(
+            color: isDark
+                ? AppTheme.darkTextPrimary
+                : AppTheme.lightTextPrimary,
+          ),
+        ),
+        content: Text(
+          'Remove $name from the group?',
+          style: TextStyle(
+            color: isDark
+                ? AppTheme.darkTextSecondary
+                : AppTheme.lightTextSecondary,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE53935),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setSheetState(() => _memberActionLoading = true);
+    setState(() => _memberActionLoading = true);
+    try {
+      final newIds = _localMembers
+          .where((m) => (m['userId'] as num?)?.toInt() != userId)
+          .map((m) => (m['userId'] as num?)?.toInt() ?? 0)
+          .where((id) => id > 0)
+          .toList();
+
+      await ApiCall.put(
+        'v1/chat/group/${widget.conversationId}/members',
+        data: {'userIds': newIds},
+      );
+
+      setSheetState(() {
+        _localMembers.removeWhere(
+          (m) => (m['userId'] as num?)?.toInt() == userId,
+        );
+        _memberActionLoading = false;
+      });
+      setState(() => _memberActionLoading = false);
+    } catch (e) {
+      setSheetState(() => _memberActionLoading = false);
+      setState(() => _memberActionLoading = false);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to remove member: $e')));
+      }
+    }
+  }
+
+  Future<void> _showAddMembersSheet(
+    BuildContext sheetCtx,
+    void Function(void Function()) setSheetState,
+    bool isDark,
+  ) async {
+    // Fetch all users
+    List<Map<String, dynamic>> allUsers = [];
+    try {
+      final res = await ApiCall.get('v1/user');
+      List<dynamic> userList = [];
+      if (res is List) {
+        userList = res;
+      } else if (res is Map && res['data'] is List) {
+        userList = res['data'] as List;
+      }
+      allUsers =
+          userList.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (_) {}
+
+    // Filter out existing members
+    final existingIds = _localMembers
+        .map((m) => (m['userId'] as num?)?.toInt() ?? 0)
+        .toSet();
+    final available = allUsers
+        .where((u) => !existingIds.contains((u['value'] as num?)?.toInt() ?? 0))
+        .toList();
+
+    if (!mounted) return;
+
+    if (available.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No users available to add')),
+      );
+      return;
+    }
+
+    final selected = <int>{};
+    final searchCtrl = TextEditingController();
+    String searchQuery = '';
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (_, setAddState) {
+          final filtered = searchQuery.isEmpty
+              ? available
+              : available
+                  .where((u) => (u['label'] as String? ?? '')
+                      .toLowerCase()
+                      .contains(searchQuery.toLowerCase()))
+                  .toList();
+
+          return DraggableScrollableSheet(
+            initialChildSize: 0.6,
+            minChildSize: 0.4,
+            maxChildSize: 0.92,
+            builder: (_, scrollCtrl) => Container(
+              decoration: BoxDecoration(
+                color: isDark ? AppTheme.darkCard : AppTheme.lightCard,
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(24),
+                ),
+              ),
+              child: Column(
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(top: 12, bottom: 8),
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: isDark
+                          ? Colors.white.withValues(alpha: 0.15)
+                          : Colors.black.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  // Header row
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Add Members',
+                            style: TextStyle(
+                              color: isDark
+                                  ? AppTheme.darkTextPrimary
+                                  : AppTheme.lightTextPrimary,
+                              fontSize: 17,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        if (selected.isNotEmpty)
+                          ElevatedButton(
+                            onPressed: _memberActionLoading
+                                ? null
+                                : () async {
+                                    setAddState(
+                                      () => _memberActionLoading = true,
+                                    );
+                                    try {
+                                      final currentIds = _localMembers
+                                          .map(
+                                            (m) =>
+                                                (m['userId'] as num?)
+                                                    ?.toInt() ??
+                                                0,
+                                          )
+                                          .where((id) => id > 0)
+                                          .toList();
+                                      final newIds = [
+                                        ...currentIds,
+                                        ...selected,
+                                      ];
+
+                                      await ApiCall.put(
+                                        'v1/chat/group/${widget.conversationId}/members',
+                                        data: {'userIds': newIds},
+                                      );
+
+                                      for (final uid in selected) {
+                                        final u = available.firstWhere(
+                                          (u) =>
+                                              (u['value'] as num?)?.toInt() ==
+                                              uid,
+                                          orElse: () => {},
+                                        );
+                                        if (u.isNotEmpty) {
+                                          setSheetState(() {
+                                            _localMembers.add({
+                                              'userId': uid,
+                                              'UserName': u['label'] ?? 'User',
+                                              'role': 'Member',
+                                            });
+                                          });
+                                          setState(() {});
+                                        }
+                                      }
+
+                                      setAddState(
+                                        () => _memberActionLoading = false,
+                                      );
+                                      if (mounted) Navigator.pop(context);
+                                    } catch (e) {
+                                      setAddState(
+                                        () => _memberActionLoading = false,
+                                      );
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Failed to add: $e'),
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF7C3AED),
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: Text('Add (${selected.length})'),
+                          ),
+                      ],
+                    ),
+                  ),
+                  // Search bar
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                    child: TextField(
+                      controller: searchCtrl,
+                      onChanged: (v) =>
+                          setAddState(() => searchQuery = v),
+                      style: TextStyle(
+                        color: isDark
+                            ? AppTheme.darkTextPrimary
+                            : AppTheme.lightTextPrimary,
+                        fontSize: 14,
+                      ),
+                      decoration: InputDecoration(
+                        hintText: 'Search members...',
+                        hintStyle: TextStyle(
+                          color: isDark
+                              ? AppTheme.darkTextSecondary
+                              : AppTheme.lightTextSecondary,
+                          fontSize: 14,
+                        ),
+                        prefixIcon: Icon(
+                          Icons.search,
+                          color: isDark
+                              ? AppTheme.darkTextSecondary
+                              : AppTheme.lightTextSecondary,
+                          size: 20,
+                        ),
+                        filled: true,
+                        fillColor: isDark
+                            ? Colors.white.withValues(alpha: 0.07)
+                            : Colors.black.withValues(alpha: 0.05),
+                        contentPadding: const EdgeInsets.symmetric(
+                          vertical: 10,
+                          horizontal: 12,
+                        ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Divider(
+                    color: isDark ? AppTheme.darkBorder : AppTheme.lightBorder,
+                    height: 1,
+                  ),
+                  Expanded(
+                    child: filtered.isEmpty
+                        ? Center(
+                            child: Text(
+                              'No results',
+                              style: TextStyle(
+                                color: isDark
+                                    ? AppTheme.darkTextSecondary
+                                    : AppTheme.lightTextSecondary,
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: scrollCtrl,
+                            itemCount: filtered.length,
+                            itemBuilder: (_, i) {
+                              final u = filtered[i];
+                              final uid =
+                                  (u['value'] as num?)?.toInt() ?? 0;
+                              final uName =
+                                  (u['label'] as String?) ?? 'User';
+                              final isChk = selected.contains(uid);
+                              return CheckboxListTile(
+                                value: isChk,
+                                onChanged: (v) {
+                                  setAddState(() {
+                                    if (v == true) {
+                                      selected.add(uid);
+                                    } else {
+                                      selected.remove(uid);
+                                    }
+                                  });
+                                },
+                                activeColor: const Color(0xFF7C3AED),
+                                title: Text(
+                                  uName,
+                                  style: TextStyle(
+                                    color: isDark
+                                        ? AppTheme.darkTextPrimary
+                                        : AppTheme.lightTextPrimary,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                secondary: Container(
+                                  width: 40,
+                                  height: 40,
+                                  decoration: BoxDecoration(
+                                    color: _avatarColor(uName),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      _initials(uName),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w700,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+
+    searchCtrl.dispose();
   }
 
   // ── Individual bubble ──────────────────────
@@ -3460,11 +3897,12 @@ class _AudioBubbleState extends State<_AudioBubble> {
       if (mounted) setState(() => _position = p);
     });
     _player.onPlayerComplete.listen((_) {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _isPlaying = false;
           _position = Duration.zero;
         });
+      }
     });
   }
 
@@ -3868,11 +4306,12 @@ class _VideoThumbnailState extends State<_VideoThumbnail> {
         maxWidth: 220,
         quality: 75,
       );
-      if (mounted)
+      if (mounted) {
         setState(() {
           _thumbnail = bytes;
           _loading = false;
         });
+      }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }

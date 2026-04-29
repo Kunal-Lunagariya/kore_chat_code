@@ -12,9 +12,9 @@ import '../../socket/socket_index.dart';
 import '../../theme/app_theme.dart';
 import '../chat/call_screen.dart';
 import '../chat/group_call_screen.dart';
-import '../chat/incoming_call_overlay.dart';
 import '../login/login_screen.dart';
 import '../chat/chat_screen.dart';
+import '../debug/debug_log_screen.dart';
 
 // ─────────────────────────────────────────────
 // Models
@@ -231,8 +231,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? _refreshTimer;
   StreamSubscription? _callAcceptedSub;
   bool _isNavigatingToCall = false;
+  // When FCM wakes app without offer, this stores callerId while waiting for socket
+  int? _waitingForOfferCallerId;
 
   OverlayEntry? _callOverlayEntry;
+  Timer? _groupRingTimer;
 
   final Set<int> _onlineUserIds = {};
 
@@ -255,10 +258,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // Listen for CallKit accept events (foreground / background)
     _callAcceptedSub = NotificationService.onCallAccepted.listen((data) {
       if (!mounted) return;
+      NotificationService.pendingAcceptedCall = null; // consumed via stream
       _handleCallKitAccepted(data);
     });
 
     // ── KEY FIX: Check if CallKit accept fired before HomeScreen built ──
+    // pendingAcceptedCall is set by NotificationService._onCallAccepted even
+    // when the broadcast stream had no listeners (cold-start race condition).
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkPendingCallKitAccept();
     });
@@ -270,23 +276,102 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (e) {}
   }
 
-  // Add this new method:
   Future<void> _checkPendingCallKitAccept() async {
     if (_isNavigatingToCall) return;
+
+    // ── PATH 1: NotificationService already processed the accept event ─────
+    // This covers the case where actionCallAccept fired before HomeScreen
+    // subscribed to the broadcast stream (cold-start race condition).
+    final pending = NotificationService.pendingAcceptedCall;
+    if (pending != null) {
+      NotificationService.pendingAcceptedCall = null;
+      debugPrint('📞 Consuming pendingAcceptedCall from NotificationService');
+      await _handleCallKitAccepted(pending);
+      return;
+    }
+
+    // ── PATH 2: actionCallAccept hasn't fired yet — check activeCalls() ────
+    // This covers the case where the app woke from VoIP push but the user
+    // hasn't tapped Accept yet, or the plugin fires the event after HomeScreen.
     try {
       final calls = await FlutterCallkitIncoming.activeCalls();
       if (calls == null || (calls as List).isEmpty) return;
 
-      // There's an active call — check if it was already accepted
-      // (i.e. we're in the accepted state, app just finished building)
       debugPrint('📞 Found active CallKit call on HomeScreen build: $calls');
 
       final call = (calls).first as Map;
       final extra = Map<String, dynamic>.from(call['extra'] as Map? ?? {});
 
-      final offerStr =
+      // Reject stale calls (older than 90 seconds)
+      final tsStr = extra['callTimestamp']?.toString() ?? '';
+      if (tsStr.isNotEmpty) {
+        final ts = int.tryParse(tsStr) ?? 0;
+        final ageMs = DateTime.now().millisecondsSinceEpoch - ts;
+        if (ageMs > 90000) {
+          debugPrint('📞 Stale CallKit call ($ageMs ms old) — ending it');
+          await FlutterCallkitIncoming.endAllCalls();
+          return;
+        }
+      }
+
+      // Handle group call resume
+      if (extra['isGroupCall'] == 'true') {
+        final conversationId =
+            int.tryParse(extra['conversationId']?.toString() ?? '0') ?? 0;
+        final callerName = extra['callerName']?.toString() ?? 'Unknown';
+        final callType = extra['callType']?.toString() ?? 'audio';
+        final groupName = extra['groupName']?.toString() ?? 'Group';
+        if (conversationId > 0 && !_isNavigatingToCall) {
+          await _handleCallKitAccepted({
+            'isGroupCall': true,
+            'conversationId': conversationId,
+            'callerName': callerName,
+            'callType': callType,
+            'groupName': groupName,
+            'myUserId': widget.userId,
+          });
+        }
+        return;
+      }
+
+      // 1-to-1 call resume
+      String offerStr =
           extra['offerJson']?.toString() ?? extra['offer']?.toString() ?? '';
-      if (offerStr.isEmpty) return; // still ringing, not accepted yet
+      int callerId = int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
+      String callerName = extra['callerName']?.toString() ?? 'Unknown';
+      String callType = extra['callType']?.toString() ?? 'audio';
+
+      // Offer missing from CallKit extra — try SharedPreferences (BGHandler saved it)
+      if (offerStr.isEmpty) {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          final ts = prefs.getInt('pending_call_timestamp') ?? 0;
+          final ageMs = DateTime.now().millisecondsSinceEpoch - ts;
+          if (ageMs < 120000) {
+            offerStr = prefs.getString('pending_call_offer_json') ?? '';
+            if (callerId == 0) {
+              callerId =
+                  int.tryParse(prefs.getString('pending_call_caller_id') ?? '0') ?? 0;
+            }
+            if (callerName == 'Unknown' || callerName.isEmpty) {
+              callerName = prefs.getString('pending_call_caller_name') ?? 'Unknown';
+            }
+            if (callType.isEmpty) {
+              callType = prefs.getString('pending_call_type') ?? 'audio';
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (callerId == 0 || _isNavigatingToCall) return;
+
+      // Offer still missing — connect socket, backend re-emits INCOMING_CALL
+      if (offerStr.isEmpty) {
+        debugPrint('📞 Cold start: no offer — waiting for socket INCOMING_CALL');
+        _waitingForOfferCallerId = callerId;
+        await _ensureSocketConnected();
+        return;
+      }
 
       Map<String, dynamic> offer = {};
       try {
@@ -295,16 +380,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
 
-      final callerId = int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
-      final callerName = extra['callerName']?.toString() ?? 'Unknown';
-      final callType = extra['callType']?.toString() ?? 'audio';
+      if (offer.isEmpty) return;
 
-      if (callerId == 0 || offer.isEmpty) return;
-
-      if (_isNavigatingToCall) return;
-
-      // Only navigate if we're not already in a call screen
-      debugPrint('📞 Resuming pending accepted call from cold start');
+      debugPrint('📞 Resuming pending accepted call from cold start (activeCalls path)');
       await _handleCallKitAccepted({
         'callerId': callerId,
         'callerName': callerName,
@@ -323,13 +401,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
     _isNavigatingToCall = true;
-    final callerId = data['callerId'] as int;
-    final callerName = data['callerName'] as String;
-    final callType = data['callType'] as String;
-    final offer = Map<String, dynamic>.from(data['offer'] as Map);
-    final myUserId = data['myUserId'] as int;
-    final roomId = data['roomId'] as int?; // ← add
-    final conversationId = data['conversationId'] as int?; // ← add
+
+    // ── Group call accepted via CallKit ──────────────────────────
+    if (data['isGroupCall'] == true) {
+      final conversationId = (data['conversationId'] as num?)?.toInt() ?? 0;
+      final callerName = data['callerName'] as String? ?? 'Unknown';
+      final callType = data['callType'] as String? ?? 'audio';
+      final groupName = data['groupName'] as String? ?? 'Group';
+      final myUserId = (data['myUserId'] as num?)?.toInt() ?? widget.userId;
+
+      await _ensureSocketConnected();
+      if (!mounted) {
+        _isNavigatingToCall = false;
+        return;
+      }
+
+      final chat = _chats.firstWhere(
+        (c) => c.conversationId == conversationId,
+        orElse: () => _chats.isNotEmpty
+            ? _chats.first
+            : RecentChat(
+                conversationId: conversationId,
+                myIsMuted: false,
+                themUserId: 0,
+                themUserName: groupName,
+                themUserRole: '',
+                themIsOnline: true,
+                groupName: groupName,
+                conversationType: 2,
+                createdBy: 0,
+                createdByName: '',
+                createdAt: DateTime.now(),
+                lastMessageText: '',
+                lastMessageSenderId: 0,
+                lastMessageType: 'text',
+                unRead: 0,
+              ),
+      );
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => GroupCallScreen(
+            myUserId: myUserId,
+            conversationId: conversationId,
+            groupName: chat.displayName,
+            callType: callType,
+            isInitiator: false,
+            groupMembers: chat.groupMembers,
+            callerName: callerName,
+          ),
+        ),
+      ).then((_) {
+        _isNavigatingToCall = false;
+        NotificationService().clearPendingCall();
+        NotificationService().endAllCalls();
+      });
+      return;
+    }
+
+    // ── 1-to-1 call accepted via CallKit ─────────────────────────
+    final callerId = (data['callerId'] as num?)?.toInt() ?? 0;
+    final callerName = data['callerName'] as String? ?? 'Unknown';
+    final callType = data['callType'] as String? ?? 'audio';
+    final myUserId = (data['myUserId'] as num?)?.toInt() ?? widget.userId;
+    final roomId = data['roomId'] as int?;
+    final conversationId = data['conversationId'] as int?;
+
+    Map<String, dynamic> offer = {};
+    final rawOffer = data['offer'];
+    if (rawOffer is Map) {
+      offer = Map<String, dynamic>.from(rawOffer);
+    }
+
+    // ── Offer missing: FCM payload was stripped (>4KB) ────────────
+    // Connect socket and wait — backend will re-emit INCOMING_CALL with offer.
+    if (offer.isEmpty || data['waitingForOffer'] == true) {
+      debugPrint('⚠️ No offer on CallKit accept — waiting for socket INCOMING_CALL');
+      _waitingForOfferCallerId = callerId;
+      _isNavigatingToCall = false; // allow onIncomingCall to navigate when offer arrives
+      await _ensureSocketConnected();
+      // onIncomingCall listener will detect _waitingForOfferCallerId and navigate directly
+      return;
+    }
 
     await _ensureSocketConnected();
     if (!mounted) return;
@@ -406,7 +560,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _registerCallListener() {
     SocketEvents.offIncomingCall();
 
-    SocketEvents.onIncomingCall((data) {
+    SocketEvents.onIncomingCall((data) async {
       if (!mounted) return;
 
       // ← If we're already in a call, ignore new incoming_call socket events
@@ -443,6 +597,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         '📞 incoming_call: fromUserId=$fromUserId fromUserName=$fromUserName',
       );
 
+      // ── Cold-start resume: user already accepted via CallKit ──────
+      // Don't ring again — navigate directly to CallScreen with the offer.
+      if (_waitingForOfferCallerId != null &&
+          _waitingForOfferCallerId == fromUserId &&
+          offer.isNotEmpty) {
+        debugPrint('📞 Got offer via socket for waiting cold-start call');
+        _waitingForOfferCallerId = null;
+        await _handleCallKitAccepted({
+          'callerId': fromUserId,
+          'callerName': fromUserName,
+          'callType': callType,
+          'offer': offer,
+          'myUserId': widget.userId,
+          'roomId': roomId,
+          'conversationId': conversationId,
+        });
+        return;
+      }
+
       NotificationService().setPendingCall(
         callerId: fromUserId,
         callerName: fromUserName,
@@ -469,33 +642,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final callerName = (map['callerName'] as String?) ?? 'Unknown';
       final callType = (map['callType'] as String?) ?? 'audio';
 
-      // Find the group chat from our chats list
       final chat = _chats.firstWhere(
         (c) => c.conversationId == conversationId,
-        orElse: () => _chats.first,
+        orElse: () => _chats.isNotEmpty
+            ? _chats.first
+            : RecentChat(
+                conversationId: conversationId,
+                myIsMuted: false,
+                themUserId: callerId,
+                themUserName: callerName,
+                themUserRole: '',
+                themIsOnline: true,
+                conversationType: 2,
+                createdBy: callerId,
+                createdByName: callerName,
+                createdAt: DateTime.now(),
+                lastMessageText: '',
+                lastMessageSenderId: 0,
+                lastMessageType: 'text',
+                unRead: 0,
+              ),
       );
 
-      debugPrint(
-        '📞 Incoming group call from $callerName in conversation $conversationId',
-      );
+      debugPrint('📞 Incoming group call from $callerName in $conversationId');
 
-      // Show incoming call overlay / navigate
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => GroupCallScreen(
-            myUserId: widget.userId,
-            conversationId: conversationId,
-            groupName: chat.displayName,
-            callType: callType,
-            isInitiator: false,
-            groupMembers: chat.groupMembers,
-            callerId: callerId,
-            callerName: callerName,
-          ),
-        ),
+      _showGroupIncomingCallOverlay(
+        conversationId: conversationId,
+        callerId: callerId,
+        callerName: callerName,
+        callType: callType,
+        groupName: chat.displayName,
+        groupMembers: chat.groupMembers,
       );
     });
+  }
+
+  void _showGroupIncomingCallOverlay({
+    required int conversationId,
+    required int callerId,
+    required String callerName,
+    required String callType,
+    required String groupName,
+    required List<Map<String, dynamic>> groupMembers,
+  }) {
+    _callOverlayEntry?.remove();
+    _groupRingTimer?.cancel();
+
+    void dismiss() {
+      _groupRingTimer?.cancel();
+      _groupRingTimer = null;
+      _callOverlayEntry?.remove();
+      _callOverlayEntry = null;
+    }
+
+    _callOverlayEntry = OverlayEntry(
+      builder: (_) => _GroupIncomingCallBanner(
+        groupName: groupName,
+        callerName: callerName,
+        callType: callType,
+        onAccept: () {
+          dismiss();
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => GroupCallScreen(
+                myUserId: widget.userId,
+                conversationId: conversationId,
+                groupName: groupName,
+                callType: callType,
+                isInitiator: false,
+                groupMembers: groupMembers,
+                callerId: callerId,
+                callerName: callerName,
+              ),
+            ),
+          );
+        },
+        onDecline: dismiss,
+      ),
+    );
+
+    Overlay.of(context).insert(_callOverlayEntry!);
+
+    _groupRingTimer = Timer(const Duration(seconds: 30), dismiss);
   }
 
   @override
@@ -709,6 +938,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _searchController.dispose();
     _callOverlayEntry?.remove();
     _callOverlayEntry = null;
+    _groupRingTimer?.cancel();
+    _groupRingTimer = null;
     _callAcceptedSub?.cancel();
 
     try {
@@ -963,6 +1194,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       overflow: TextOverflow.ellipsis,
                     ),
                   ],
+                ),
+              ),
+              _iconBtn(
+                Icons.bug_report_outlined,
+                isDark,
+                () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const DebugLogScreen()),
                 ),
               ),
               _iconBtn(
@@ -2398,6 +2637,252 @@ class _NewChatModalState extends State<_NewChatModal> {
                       : AppTheme.lightTextSecondary.withOpacity(0.4),
                 ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Group incoming call banner overlay ───────────────────────────
+
+class _GroupIncomingCallBanner extends StatefulWidget {
+  final String groupName;
+  final String callerName;
+  final String callType;
+  final VoidCallback onAccept;
+  final VoidCallback onDecline;
+
+  const _GroupIncomingCallBanner({
+    required this.groupName,
+    required this.callerName,
+    required this.callType,
+    required this.onAccept,
+    required this.onDecline,
+  });
+
+  @override
+  State<_GroupIncomingCallBanner> createState() =>
+      _GroupIncomingCallBannerState();
+}
+
+class _GroupIncomingCallBannerState extends State<_GroupIncomingCallBanner>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  late Animation<Offset> _slide;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 450),
+    );
+    _slide = Tween<Offset>(
+      begin: const Offset(0, 1.0),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOutCubic));
+    _ctrl.forward();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  String _initials(String name) {
+    final parts = name.trim().split(' ').where((p) => p.isNotEmpty).toList();
+    if (parts.length >= 2) return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
+    if (parts.length == 1) return parts[0][0].toUpperCase();
+    return '?';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    return SlideTransition(
+      position: _slide,
+      child: Material(
+        color: Colors.transparent,
+        child: Container(
+          width: size.width,
+          height: size.height,
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF0D0D1A), Color(0xFF1A0D2E), Color(0xFF0D1A1A)],
+            ),
+          ),
+          child: SafeArea(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                // ── Top info ────────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.only(top: 60),
+                  child: Column(
+                    children: [
+                      Container(
+                        width: 100,
+                        height: 100,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF7C3AED),
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: const Color(0xFF7C3AED).withOpacity(0.4),
+                              blurRadius: 32,
+                              spreadRadius: 4,
+                            ),
+                          ],
+                        ),
+                        child: Center(
+                          child: Text(
+                            _initials(widget.groupName),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 34,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      Text(
+                        widget.groupName,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 26,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            widget.callType == 'video'
+                                ? Icons.videocam_rounded
+                                : Icons.call_rounded,
+                            size: 16,
+                            color: const Color(0xFF9333EA),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '${widget.callerName} is calling',
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        widget.callType == 'video'
+                            ? 'Incoming Group Video Call'
+                            : 'Incoming Group Audio Call',
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                // ── Buttons ─────────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 60),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      // Decline
+                      Column(
+                        children: [
+                          GestureDetector(
+                            onTap: widget.onDecline,
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFE53935),
+                                shape: BoxShape.circle,
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(
+                                      0xFFE53935,
+                                    ).withOpacity(0.4),
+                                    blurRadius: 20,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                              child: const Icon(
+                                Icons.call_end_rounded,
+                                color: Colors.white,
+                                size: 32,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'Decline',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                      // Accept
+                      Column(
+                        children: [
+                          GestureDetector(
+                            onTap: widget.onAccept,
+                            child: Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF43A047),
+                                shape: BoxShape.circle,
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(
+                                      0xFF43A047,
+                                    ).withOpacity(0.4),
+                                    blurRadius: 20,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                              child: Icon(
+                                widget.callType == 'video'
+                                    ? Icons.videocam_rounded
+                                    : Icons.call_rounded,
+                                color: Colors.white,
+                                size: 32,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'Join',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

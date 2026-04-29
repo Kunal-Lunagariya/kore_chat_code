@@ -9,11 +9,10 @@ import 'package:flutter_callkit_incoming/entities/entities.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
-import '../screens/chat/call_screen.dart';
 import '../socket/socket_events.dart';
 import '../socket/socket_index.dart';
-import 'firebase_messaging_service.dart';
-import 'navigation_service.dart';
+import 'api_call_service.dart';
+import 'debug_logger.dart';
 
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
@@ -29,6 +28,10 @@ class NotificationService {
   String? _voipToken;
   String? get voipToken => _voipToken;
   String? _currentCallUuid;
+
+  // Persists the accepted call across the broadcast-stream drop window on cold start.
+  // Set in _onCallAccepted; read and cleared by HomeScreen._checkPendingCallKitAccept.
+  static Map<String, dynamic>? pendingAcceptedCall;
 
   // Pending call — set by socket when app is foreground
   Map<String, dynamic>? _pendingOffer;
@@ -87,8 +90,6 @@ class NotificationService {
   // ── Init ───────────────────────────────────────────────────────
 
   Future<void> init() async {
-    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-
     await _fcm.requestPermission(
       alert: true,
       badge: true,
@@ -130,16 +131,33 @@ class NotificationService {
 
     _fcmToken = await _getTokenWithRetry();
     debugPrint('📱 FCM Token: $_fcmToken');
+    await DebugLogger.log(
+      'NotifService',
+      'init fcmToken=${_fcmToken?.substring(0, 20) ?? 'NULL'}...',
+    );
 
     if (Platform.isIOS) {
-      final voip = await FlutterCallkitIncoming.getDevicePushTokenVoIP();
+      // PushKit delivers the token asynchronously — poll until it's ready.
+      // Without this, voipToken is NULL on first read, and the backend stores null.
+      String? voip;
+      for (int i = 0; i < 15; i++) {
+        voip = await FlutterCallkitIncoming.getDevicePushTokenVoIP();
+        if (voip != null && voip.isNotEmpty) break;
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
       _voipToken = voip;
-      debugPrint("📱 VoIP Token Saved: $_voipToken");
+      debugPrint("📱 VoIP Token: ${_voipToken ?? 'NULL after retries'}");
+      await DebugLogger.log(
+        'NotifService',
+        'voipToken=${_voipToken == null ? 'NULL' : _voipToken!.substring(0, (_voipToken!.length).clamp(0, 20))}...',
+      );
     }
 
     _fcm.onTokenRefresh.listen((token) {
       _fcmToken = token;
       debugPrint('📱 FCM Token Refreshed: $token');
+      DebugLogger.log('NotifService', 'tokenRefresh new=${token.substring(0, 20)}...');
+      _pushTokensToBackend();
     });
 
     // Foreground FCM messages
@@ -193,36 +211,75 @@ class NotificationService {
     try {
       final calls = await FlutterCallkitIncoming.activeCalls();
       debugPrint('📞 Active calls on resume: $calls');
-      if (calls != null && (calls as List).isNotEmpty) {
-        final call = (calls).first as Map;
-        final extra = call['extra'] as Map? ?? {};
-        final callerId =
-            int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
-        final callerName = extra['callerName']?.toString() ?? 'Unknown';
-        final callType = extra['callType']?.toString() ?? 'audio';
-        final offerStr = extra['offerJson']?.toString() ?? '';
+      if (calls == null || (calls as List).isEmpty) return;
 
-        Map<String, dynamic> offer = {};
-        if (offerStr.isNotEmpty) {
-          try {
-            offer = Map<String, dynamic>.from(jsonDecode(offerStr) as Map);
-          } catch (_) {}
-        }
+      final call = (calls).first as Map;
+      final extra = call['extra'] as Map? ?? {};
 
-        if (callerId > 0) {
-          setPendingCall(
-            callerId: callerId,
-            callerName: callerName,
-            callType: callType,
-            offer: offer,
-          );
-          _incomingCallController.add({
-            'callerId': callerId,
-            'callerName': callerName,
-            'callType': callType,
-            'offer': offer,
-          });
+      // Reject stale calls (older than 90 seconds)
+      final tsStr = extra['callTimestamp']?.toString() ?? '';
+      if (tsStr.isNotEmpty) {
+        final ts = int.tryParse(tsStr) ?? 0;
+        final ageMs = DateTime.now().millisecondsSinceEpoch - ts;
+        if (ageMs > 90000) {
+          debugPrint('📞 Stale CallKit call on resume ($ageMs ms) — ending');
+          await FlutterCallkitIncoming.endAllCalls();
+          return;
         }
+      }
+
+      // Group call resume — fire callAccepted so HomeScreen can navigate
+      if (extra['isGroupCall'] == 'true') {
+        final conversationId =
+            int.tryParse(extra['conversationId']?.toString() ?? '0') ?? 0;
+        if (conversationId > 0) {
+          if (_myUserId == null) {
+            try {
+              final prefs = await SharedPreferences.getInstance();
+              _myUserId = prefs.getInt('user_id');
+            } catch (_) {}
+          }
+          if (_myUserId != null) {
+            _callAcceptedController.add({
+              'isGroupCall': true,
+              'conversationId': conversationId,
+              'callerName': extra['callerName']?.toString() ?? 'Unknown',
+              'callType': extra['callType']?.toString() ?? 'audio',
+              'groupName': extra['groupName']?.toString() ?? 'Group',
+              'myUserId': _myUserId!,
+            });
+          }
+        }
+        return;
+      }
+
+      // 1-to-1 call — store pending offer so HomeScreen can navigate
+      final callerId =
+          int.tryParse(extra['callerId']?.toString() ?? '0') ?? 0;
+      final callerName = extra['callerName']?.toString() ?? 'Unknown';
+      final callType = extra['callType']?.toString() ?? 'audio';
+      final offerStr = extra['offerJson']?.toString() ?? '';
+
+      Map<String, dynamic> offer = {};
+      if (offerStr.isNotEmpty) {
+        try {
+          offer = Map<String, dynamic>.from(jsonDecode(offerStr) as Map);
+        } catch (_) {}
+      }
+
+      if (callerId > 0) {
+        setPendingCall(
+          callerId: callerId,
+          callerName: callerName,
+          callType: callType,
+          offer: offer,
+        );
+        _incomingCallController.add({
+          'callerId': callerId,
+          'callerName': callerName,
+          'callType': callType,
+          'offer': offer,
+        });
       }
     } catch (e) {
       debugPrint('⚠️ checkForMissedCallOnResume error: $e');
@@ -259,6 +316,14 @@ class NotificationService {
     final data = message.data;
     final type = data['type'] ?? 'message';
 
+    // Log full message structure so backend payload can be inspected
+    await DebugLogger.log(
+      'FGMessage',
+      'type=$type hasNotifBlock=${message.notification != null} '
+          'notifTitle=${message.notification?.title} '
+          'dataKeys=${data.keys.toList()}',
+    );
+
     debugPrint('📨 FCM foreground type: $type');
 
     if (type == 'call') {
@@ -289,6 +354,9 @@ class NotificationService {
       // Don't show any UI here — socket onIncomingCall handles it
       return;
     }
+
+    // Group call in foreground — socket handles the overlay, skip notification
+    if (type == 'group_call') return;
 
     // Messages — iOS handled natively by Firebase, Android handled below
     if (Platform.isAndroid) {
@@ -325,8 +393,13 @@ class NotificationService {
 
     switch (event.event) {
       case Event.actionDidUpdateDevicePushTokenVoip:
-        _voipToken = event.body['devicePushTokenVoip'];
-        debugPrint('📱 VoIP Token: $_voipToken');
+        final newVoip = event.body['devicePushTokenVoip']?.toString();
+        if (newVoip != null && newVoip.isNotEmpty) {
+          _voipToken = newVoip;
+          debugPrint('📱 VoIP Token updated: $_voipToken');
+          DebugLogger.log('NotifService', 'voipTokenUpdate → pushing to backend');
+          _pushTokensToBackend(); // Always re-register so backend always has latest token
+        }
         break;
 
       case Event.actionCallAccept:
@@ -335,6 +408,10 @@ class NotificationService {
 
       case Event.actionCallDecline:
         _onCallDeclined(event.body);
+        break;
+
+      case Event.actionCallToggleAudioSession:
+        // Let WebRTC manage the audio session — do nothing here
         break;
 
       case Event.actionCallEnded:
@@ -361,10 +438,12 @@ class NotificationService {
   Future<void> _onCallAccepted(dynamic body) async {
     if (_callAcceptBroadcast) {
       debugPrint('⚠️ _onCallAccepted already fired — ignoring duplicate');
+      await DebugLogger.log('NotifService', 'callAccept DUPLICATE — ignored');
       return;
     }
     _callAcceptBroadcast = true;
 
+    await DebugLogger.log('NotifService', 'callAccept FIRED body=${body.runtimeType}');
     debugPrint('✅ CallKit accepted: $body');
 
     Map<String, dynamic>? offer = _pendingOffer;
@@ -377,6 +456,39 @@ class NotificationService {
       final extra = (body is Map)
           ? Map<String, dynamic>.from(body['extra'] as Map? ?? {})
           : <String, dynamic>{};
+
+      // ── Group call accepted via CallKit ───────────────────────
+      if (extra['isGroupCall'] == 'true') {
+        await DebugLogger.log('NotifService', 'callAccept groupCall path');
+        final conversationId =
+            int.tryParse(extra['conversationId']?.toString() ?? '0') ?? 0;
+        if (conversationId == 0) {
+          debugPrint('⚠️ Group call accept: missing conversationId');
+          await DebugLogger.log('NotifService', 'callAccept groupCall missing conversationId');
+          await endAllCalls();
+          return;
+        }
+        if (_myUserId == null) {
+          try {
+            final prefs = await SharedPreferences.getInstance();
+            _myUserId = prefs.getInt('user_id');
+          } catch (_) {}
+        }
+        if (_myUserId == null) {
+          debugPrint('⚠️ Group call accept: myUserId null');
+          await endAllCalls();
+          return;
+        }
+        _callAcceptedController.add({
+          'isGroupCall': true,
+          'conversationId': conversationId,
+          'callerName': extra['callerName']?.toString() ?? 'Unknown',
+          'callType': extra['callType']?.toString() ?? 'audio',
+          'groupName': extra['groupName']?.toString() ?? 'Group',
+          'myUserId': _myUserId!,
+        });
+        return;
+      }
 
       // Offer
       if (offer == null || offer.isEmpty) {
@@ -405,19 +517,7 @@ class NotificationService {
       debugPrint('⚠️ Could not parse extra: $e');
     }
 
-    if (offer == null || offer.isEmpty) {
-      debugPrint('⚠️ No WebRTC offer — cannot start call');
-      await endAllCalls();
-      return;
-    }
-
-    if (callerId == null || callerId == 0) {
-      debugPrint('⚠️ Missing callerId');
-      await endAllCalls();
-      return;
-    }
-
-    // ── KEY FIX: Read myUserId from prefs if not set (cold start) ──
+    // ── Read myUserId from prefs if not set (cold start) ─────────
     if (_myUserId == null) {
       try {
         final prefs = await SharedPreferences.getInstance();
@@ -430,13 +530,89 @@ class NotificationService {
 
     if (_myUserId == null) {
       debugPrint('⚠️ myUserId still null — cannot start call');
+      await DebugLogger.log('NotifService', 'callAccept ABORT myUserId null');
       await endAllCalls();
       return;
     }
 
-    debugPrint('📞 Broadcasting call accept: caller=$callerName id=$callerId');
+    if (callerId == null || callerId == 0) {
+      debugPrint('⚠️ Missing callerId');
+      await DebugLogger.log('NotifService', 'callAccept ABORT callerId null/0');
+      await endAllCalls();
+      return;
+    }
 
-    _callAcceptedController.add({
+    // ── Offer missing (FCM payload was too large, stripped by Firebase) ─
+    // Try to read from SharedPreferences saved by BGHandler.
+    // If still missing, connect the socket — backend will re-emit INCOMING_CALL
+    // with the offer once we join the room.
+    if (offer == null || offer.isEmpty) {
+      debugPrint('⚠️ No offer in CallKit extra — checking prefs (FCM cold start)');
+      await DebugLogger.log('NotifService', 'offer missing — checking prefs');
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final ts = prefs.getInt('pending_call_timestamp') ?? 0;
+        final ageMs = DateTime.now().millisecondsSinceEpoch - ts;
+        // Only use prefs offer if it was saved within the last 2 minutes
+        if (ageMs < 120000) {
+          final offerStr = prefs.getString('pending_call_offer_json') ?? '';
+          if (offerStr.isNotEmpty) {
+            try {
+              offer = Map<String, dynamic>.from(jsonDecode(offerStr) as Map);
+              debugPrint('✅ Loaded offer from prefs');
+              await DebugLogger.log('NotifService', 'offer loaded from prefs OK');
+            } catch (_) {}
+          }
+          // Also recover caller info from prefs if still missing
+          if (callerId == 0) {
+            callerId = int.tryParse(
+                  prefs.getString('pending_call_caller_id') ?? '0') ?? 0;
+          }
+          if (callerName.isEmpty) {
+            callerName =
+                prefs.getString('pending_call_caller_name') ?? 'Unknown';
+          }
+          if (callType.isEmpty) {
+            callType = prefs.getString('pending_call_type') ?? 'audio';
+          }
+        }
+      } catch (e) {
+        debugPrint('⚠️ Prefs offer read error: $e');
+      }
+    }
+
+    // ── Offer still missing — connect socket and wait for backend to send it
+    if (offer == null || offer.isEmpty) {
+      debugPrint('⚠️ Offer still missing after prefs check — will wait for socket INCOMING_CALL');
+      await DebugLogger.log(
+        'NotifService',
+        'offer still missing — connecting socket, waiting for INCOMING_CALL',
+      );
+      await _ensureSocketConnected();
+      // Set a flag so HomeScreen knows to listen for the incoming call event
+      // from the socket (backend will re-emit it when user joins)
+      _pendingCallerId = callerId;
+      _pendingCallerName = callerName;
+      _pendingCallType = callType;
+      // Broadcast with empty offer — HomeScreen will listen for socket offer
+      _callAcceptedController.add({
+        'callerId': callerId,
+        'callerName': callerName,
+        'callType': callType,
+        'offer': <String, dynamic>{},  // empty — will come via socket
+        'myUserId': _myUserId!,
+        'waitingForOffer': true,       // signal to HomeScreen
+      });
+      return;
+    }
+
+    debugPrint('📞 Broadcasting call accept: caller=$callerName id=$callerId');
+    await DebugLogger.log(
+      'NotifService',
+      'callAccept broadcasting caller=$callerName id=$callerId offerEmpty=${offer.isEmpty}',
+    );
+
+    final payload = {
       'callerId': callerId,
       'callerName': callerName,
       'callType': callType,
@@ -445,7 +621,12 @@ class NotificationService {
       'messageId': _pendingMessageId,
       'roomId': _pendingRoomId,
       'conversationId': _pendingConversationId,
-    });
+    };
+
+    // Save for HomeScreen to read if it hasn't subscribed yet (cold-start race).
+    pendingAcceptedCall = payload;
+
+    _callAcceptedController.add(payload);
   }
 
   // ── ADDED: Wait for socket to connect (up to 8 seconds) ──────────
@@ -497,6 +678,34 @@ class NotificationService {
       }
     } catch (e) {
       debugPrint('⚠️ _ensureSocketConnected error: $e');
+    }
+  }
+
+  Future<void> _pushTokensToBackend() async {
+    try {
+      if (_myUserId == null) {
+        final prefs = await SharedPreferences.getInstance();
+        _myUserId = prefs.getInt('user_id');
+      }
+      if (_myUserId == null || _fcmToken == null || _fcmToken!.isEmpty) return;
+      await ApiCall.post(
+        'v1/user/user-device',
+        data: {
+          'userId': _myUserId,
+          'deviceType': Platform.isIOS ? 'ios' : 'android',
+          'fcmToken': _fcmToken,
+          'voIpToken': _voipToken,
+        },
+      );
+      debugPrint('✅ Tokens pushed to backend');
+      await DebugLogger.log(
+        'NotifService',
+        'tokensPushed userId=$_myUserId platform=${Platform.isIOS ? 'ios' : 'android'} '
+            'fcm=${_fcmToken?.substring(0, 20)}... voip=${_voipToken?.substring(0, 10) ?? 'null'}...',
+      );
+    } catch (e) {
+      debugPrint('⚠️ _pushTokensToBackend error: $e');
+      await DebugLogger.log('NotifService', 'tokensPushFailed: $e');
     }
   }
 
@@ -606,6 +815,7 @@ class NotificationService {
         'callerName': callerName,
         'callType': callType,
         'offerJson': offerJson,
+        'callTimestamp': DateTime.now().millisecondsSinceEpoch.toString(),
       },
       headers: <String, dynamic>{},
       android: AndroidParams(
@@ -625,7 +835,7 @@ class NotificationService {
         maximumCallGroups: 1,
         maximumCallsPerCallGroup: 1,
         audioSessionMode: 'voiceChat',
-        audioSessionActive: true,
+        audioSessionActive: false,
         audioSessionPreferredSampleRate: 44100.0,
         audioSessionPreferredIOBufferDuration: 0.005,
         supportsDTMF: false,

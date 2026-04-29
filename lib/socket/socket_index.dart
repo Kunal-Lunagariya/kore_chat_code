@@ -6,10 +6,47 @@ class SocketIndex {
   static String? _token;
   static int? _userId;
   static String? _activeConversationId;
-  static VoidCallback? _onReconnectCallback;
+  static final List<VoidCallback> _reconnectCallbacks = [];
+  static DateTime? _lastCallEndTime;
+  static bool _callActive = false;
 
+  /// Call this whenever a call ends (hang-up, decline, remote end).
+  /// Suppresses `call_ready` for 20 s so the backend does not replay
+  /// the just-ended call offer when the socket reconnects.
+  static void notifyCallEnded() {
+    _lastCallEndTime = DateTime.now();
+    _callActive = false;
+  }
+
+  /// Set true when a CallScreen or GroupCallScreen is active.
+  /// Prevents `call_ready` from being emitted on reconnect during a live call,
+  /// which would otherwise cause the backend to re-deliver the call and end it.
+  static void setCallActive(bool active) {
+    _callActive = active;
+  }
+
+  static bool get _callReadyCooldownActive {
+    if (_lastCallEndTime == null) return false;
+    return DateTime.now().difference(_lastCallEndTime!).inSeconds < 20;
+  }
+
+  /// Adds a reconnect callback. Multiple callbacks are supported.
+  static void addReconnectCallback(VoidCallback callback) {
+    if (!_reconnectCallbacks.contains(callback)) {
+      _reconnectCallbacks.add(callback);
+    }
+  }
+
+  /// Removes a previously added reconnect callback.
+  static void removeReconnectCallback(VoidCallback callback) {
+    _reconnectCallbacks.remove(callback);
+  }
+
+  /// Convenience: replaces all existing reconnect callbacks with one.
   static void setReconnectCallback(VoidCallback callback) {
-    _onReconnectCallback = callback;
+    _reconnectCallbacks
+      ..clear()
+      ..add(callback);
   }
 
   static void setActiveConversation(String? id) {
@@ -34,6 +71,7 @@ class SocketIndex {
 
     _socket = IO.io(
       'https://chatapi.koremobiles.in',
+      // 'https://p1gxv75p-5031.inc1.devtunnels.ms',
       IO.OptionBuilder()
           .setTransports(['websocket'])
           .setAuth({'token': token})
@@ -49,6 +87,7 @@ class SocketIndex {
 
     _socket!.onConnect((_) {
       print('🟢 Socket Connected: ${_socket!.id}');
+      if (!_callActive && !_callReadyCooldownActive) _socket!.emit('call_ready');
       if (_activeConversationId != null) {
         _socket!.emit('join_conversation', {
           'conversationId': _activeConversationId,
@@ -62,6 +101,7 @@ class SocketIndex {
 
     _socket!.on('reconnect', (attemptNumber) {
       print('🔁 Socket Reconnected (attempt $attemptNumber)');
+      if (!_callActive && !_callReadyCooldownActive) _socket!.emit('call_ready');
       if (_activeConversationId != null) {
         _socket!.emit('join_conversation', {
           'conversationId': _activeConversationId,
@@ -70,7 +110,9 @@ class SocketIndex {
       if (_userId != null) {
         _socket!.emit('user_online', {'userId': _userId});
       }
-      _onReconnectCallback?.call();
+      for (final cb in List<VoidCallback>.from(_reconnectCallbacks)) {
+        cb();
+      }
     });
 
     _socket!.onDisconnect((reason) {

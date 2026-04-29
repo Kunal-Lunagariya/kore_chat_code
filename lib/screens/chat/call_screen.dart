@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/notification_service.dart';
 import '../../socket/socket_events.dart';
+import '../../socket/socket_index.dart';
 
 enum CallState { idle, calling, ringing, incoming, active, ended }
 
@@ -40,11 +42,13 @@ class CallScreen extends StatefulWidget {
 class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   // ── WebRTC ──────────────────────────────────────────────────────
   RTCPeerConnection? _pc;
+  RTCDataChannel? _dataChannel;
   MediaStream? _localStream;
   MediaStream? _remoteStream;
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   final List<RTCIceCandidate> _pendingCandidates = [];
+  Map<String, dynamic>? _pendingAnswer; // answer arrived before PC was ready
   bool _remoteDescSet = false;
   int? _roomId;
   int? _conversationId;
@@ -56,6 +60,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   bool _isVideoOff = false;
   bool _isFrontCamera = true;
   bool _controlsVisible = true;
+  bool _remoteIsMuted = false;
   int _elapsed = 0;
   Timer? _timer;
   Timer? _controlsTimer;
@@ -85,6 +90,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    SocketIndex.setCallActive(true);
     _initAnimations();
     _init();
   }
@@ -141,7 +147,10 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
         SocketEvents.emitCallRinging(toUserId: widget.remoteUserId);
       } catch (_) {}
       if (widget.autoAnswer && widget.incomingOffer != null) {
-        await Future.delayed(const Duration(milliseconds: 500));
+        // iOS: wait for CallKit to fully release the audio session to WebRTC
+        if (Platform.isIOS) {
+          await Future.delayed(const Duration(milliseconds: 400));
+        }
         await _answerCall();
       }
     }
@@ -153,6 +162,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     _controlsTimer?.cancel();
     _pulseCtrl.dispose();
     _controlsFadeCtrl.dispose();
+    SocketIndex.setCallActive(false);
     _cleanupPC();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
@@ -206,19 +216,23 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     SocketEvents.onCallUnavailableWait((data) {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
-      if (map['roomId'] != null)
+      if (map['roomId'] != null) {
         _roomId = int.tryParse(map['roomId'].toString());
-      if (map['conversationId'] != null)
+      }
+      if (map['conversationId'] != null) {
         _conversationId = int.tryParse(map['conversationId'].toString());
+      }
     });
 
     SocketEvents.onCallRingingNow((data) {
       if (!mounted) return;
       final map = Map<String, dynamic>.from(data as Map);
-      if (map['roomId'] != null)
+      if (map['roomId'] != null) {
         _roomId = int.tryParse(map['roomId'].toString());
-      if (map['conversationId'] != null)
+      }
+      if (map['conversationId'] != null) {
         _conversationId = int.tryParse(map['conversationId'].toString());
+      }
       if (_callState == CallState.calling) {
         setState(() => _callState = CallState.ringing);
       }
@@ -277,6 +291,9 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     };
     pc.onConnectionState = (state) {
       if (!mounted) return;
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        Helper.setSpeakerphoneOn(_isSpeakerOn).catchError((_) {});
+      }
       if ([
         RTCPeerConnectionState.RTCPeerConnectionStateDisconnected,
         RTCPeerConnectionState.RTCPeerConnectionStateFailed,
@@ -285,17 +302,48 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
         _handleRemoteHangup();
       }
     };
+    // Answerer side: receive the data channel the caller created
+    pc.onDataChannel = (dc) => _setupDataChannel(dc);
     _pc = pc;
     return pc;
+  }
+
+  void _setupDataChannel(RTCDataChannel dc) {
+    _dataChannel = dc;
+    dc.onDataChannelState = (s) {
+      if (s == RTCDataChannelState.RTCDataChannelOpen) _sendMyState();
+    };
+    dc.onMessage = (msg) {
+      try {
+        final map = jsonDecode(msg.text) as Map<String, dynamic>;
+        if (mounted) setState(() => _remoteIsMuted = map['muted'] as bool? ?? false);
+      } catch (_) {}
+    };
+  }
+
+  void _sendMyState() {
+    try {
+      if (_dataChannel?.state == RTCDataChannelState.RTCDataChannelOpen) {
+        _dataChannel!.send(RTCDataChannelMessage(
+          jsonEncode({'muted': _isMuted, 'videoOff': _isVideoOff}),
+        ));
+      }
+    } catch (_) {}
   }
 
   Future<void> _startOutgoingCall() async {
     try {
       _localStream = await _getMedia();
+      _localStream?.getAudioTracks().forEach((t) => t.enabled = true);
       _localRenderer.srcObject = _localStream;
       if (mounted) setState(() {});
       final pc = await _createPC();
       _localStream!.getTracks().forEach((t) => pc.addTrack(t, _localStream!));
+      // Caller creates the data channel
+      try {
+        final dc = await pc.createDataChannel('state', RTCDataChannelInit()..ordered = true);
+        _setupDataChannel(dc);
+      } catch (_) {}
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       SocketEvents.emitCallUser(
@@ -303,6 +351,11 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
         offer: {'type': offer.type, 'sdp': offer.sdp},
         callType: widget.callType,
       );
+      // Apply answer that may have arrived while we were creating the PC
+      if (_pendingAnswer != null) {
+        await _applyAnswer(_pendingAnswer!);
+        _pendingAnswer = null;
+      }
     } catch (e) {
       debugPrint('Error starting call: $e');
       if (mounted) Navigator.pop(context);
@@ -313,6 +366,8 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     if (widget.incomingOffer == null) return;
     try {
       _localStream = await _getMedia();
+      // Explicitly enable audio — iOS/CallKit may deliver disabled tracks
+      _localStream?.getAudioTracks().forEach((t) => t.enabled = true);
       _localRenderer.srcObject = _localStream;
       final pc = await _createPC();
       _localStream!.getTracks().forEach((t) => pc.addTrack(t, _localStream!));
@@ -349,9 +404,16 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _applyAnswer(Map<String, dynamic> answerMap) async {
-    if (_pc == null) return;
-
+    // PC may not be ready yet — cache and apply once _startOutgoingCall creates it
+    if (_pc == null) {
+      _pendingAnswer = answerMap;
+      return;
+    }
     try {
+      if (_pc!.signalingState !=
+          RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+        return;
+      }
       await _pc!.setRemoteDescription(
         RTCSessionDescription(
           answerMap['sdp'] as String,
@@ -364,6 +426,9 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
       }
       _pendingCandidates.clear();
       _startTimer();
+      try {
+        await Helper.setSpeakerphoneOn(_isSpeakerOn);
+      } catch (_) {}
       if (mounted) setState(() => _callState = CallState.active);
     } catch (e) {
       debugPrint('Error applying answer: $e');
@@ -372,6 +437,8 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
 
   void _cleanupPC() {
     _timer?.cancel();
+    _dataChannel?.close();
+    _dataChannel = null;
     _localStream?.getTracks().forEach((t) => t.stop());
     _localStream?.dispose();
     _localStream = null;
@@ -405,6 +472,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
 
     // 1. End CallKit ring FIRST — this stops the ring on both sides
     NotificationService().endAllCalls();
+    SocketIndex.notifyCallEnded();
 
     // 2. Tell other side
     try {
@@ -435,6 +503,7 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
     if (_callState == CallState.ended) return; // guard double fire
 
     NotificationService().endAllCalls();
+    SocketIndex.notifyCallEnded();
     _cleanupPC();
 
     if (!mounted) return;
@@ -447,16 +516,20 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
   void _toggleMute() {
     _localStream?.getAudioTracks().forEach((t) => t.enabled = !t.enabled);
     setState(() => _isMuted = !_isMuted);
+    _sendMyState();
   }
 
-  void _toggleSpeaker() {
+  Future<void> _toggleSpeaker() async {
     setState(() => _isSpeakerOn = !_isSpeakerOn);
-    Helper.setSpeakerphoneOn(_isSpeakerOn);
+    try {
+      await Helper.setSpeakerphoneOn(_isSpeakerOn);
+    } catch (_) {}
   }
 
   void _toggleVideo() {
     _localStream?.getVideoTracks().forEach((t) => t.enabled = !t.enabled);
     setState(() => _isVideoOff = !_isVideoOff);
+    _sendMyState();
   }
 
   Future<void> _switchCamera() async {
@@ -752,9 +825,38 @@ class _CallScreenState extends State<CallScreen> with TickerProviderStateMixin {
         // ── Remote video fullscreen ──
         if (isActive && _remoteStream != null)
           Positioned.fill(
-            child: RTCVideoView(
-              _remoteRenderer,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: RTCVideoView(
+                    _remoteRenderer,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                  ),
+                ),
+                if (_remoteIsMuted)
+                  Positioned(
+                    bottom: 100,
+                    left: 16,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.mic_off_rounded, color: Color(0xFFE53935), size: 16),
+                          const SizedBox(width: 4),
+                          Text(
+                            widget.remoteUserName,
+                            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
             ),
           )
         else

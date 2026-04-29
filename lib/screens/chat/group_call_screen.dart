@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../services/notification_service.dart';
 import '../../socket/socket_events.dart';
+import '../../socket/socket_index.dart';
 
 enum GroupCallState { calling, active, ended }
 
@@ -41,6 +43,7 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   final Map<int, MediaStream> _remoteStreams = {};
   final Map<int, List<RTCIceCandidate>> _pendingCandidates = {};
   final Map<int, RTCVideoRenderer> _remoteRenderers = {};
+  final Map<int, RTCDataChannel> _dataChannels = {};
   MediaStream? _localStream;
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
 
@@ -53,9 +56,12 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   int _elapsed = 0;
   Timer? _timer;
 
-  // ── Active participant names ───────────────────────────────────
+  // ── Active participant names + their media states ──────────────
   // userId → name (for display)
   final Map<int, String> _participantNames = {};
+  final Map<int, bool> _peerIsMuted = {};
+  final Map<int, bool> _peerIsVideoOff = {};
+  bool _cleanedUp = false;
 
   bool get _isVideo => widget.callType == 'video';
 
@@ -77,6 +83,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
       duration: const Duration(milliseconds: 2000),
     )..repeat();
 
+    SocketIndex.setCallActive(true);
+    SocketIndex.addReconnectCallback(_onSocketReconnect);
+
     _localRenderer.initialize();
     _registerSocketListeners();
     _initCall();
@@ -86,6 +95,8 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   void dispose() {
     _timer?.cancel();
     _pulseCtrl.dispose();
+    SocketIndex.setCallActive(false);
+    SocketIndex.removeReconnectCallback(_onSocketReconnect);
     _cleanupAll();
     SocketEvents.offGroupCallUserJoined();
     SocketEvents.offGroupCallUserLeft();
@@ -95,6 +106,15 @@ class _GroupCallScreenState extends State<GroupCallScreen>
     SocketEvents.offGroupCallEnded();
     NotificationService().endAllCalls();
     super.dispose();
+  }
+
+  /// Re-joins the group call room when the socket reconnects mid-call.
+  void _onSocketReconnect() {
+    if (_state != GroupCallState.active || !mounted) return;
+    SocketEvents.emitGroupCallJoin(
+      conversationId: widget.conversationId,
+      userId: widget.myUserId,
+    );
   }
 
   void _registerSocketListeners() {
@@ -153,7 +173,8 @@ class _GroupCallScreenState extends State<GroupCallScreen>
         (cMap['sdpMLineIndex'] as num?)?.toInt(),
       );
       final pc = _pcs[fromUserId];
-      if (pc != null && pc.signalingState != RTCSignalingState.RTCSignalingStateClosed) {
+      if (pc != null &&
+          pc.signalingState != RTCSignalingState.RTCSignalingStateClosed) {
         await pc.addCandidate(candidate);
       } else {
         _pendingCandidates.putIfAbsent(fromUserId, () => []).add(candidate);
@@ -174,10 +195,11 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   void _addParticipantName(int userId) {
     if (_participantNames.containsKey(userId)) return;
     final member = widget.groupMembers.firstWhere(
-          (m) => (m['userId'] as num?)?.toInt() == userId,
+      (m) => (m['userId'] as num?)?.toInt() == userId,
       orElse: () => {},
     );
-    final name = (member['UserName'] as String?) ??
+    final name =
+        (member['UserName'] as String?) ??
         (member['userName'] as String?) ??
         'User $userId';
     setState(() => _participantNames[userId] = name.trim().split(' ').first);
@@ -186,6 +208,8 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   Future<void> _initCall() async {
     try {
       _localStream = await _getMedia();
+      // Explicitly enable audio in case the OS delivered a disabled track
+      _localStream?.getAudioTracks().forEach((t) => t.enabled = true);
       _localRenderer.srcObject = _localStream;
       if (mounted) setState(() {});
 
@@ -217,25 +241,25 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   Future<MediaStream> _getMedia() async {
     final constraints = _isVideo
         ? {
-      'audio': {
-        'echoCancellation': true,
-        'noiseSuppression': true,
-        'autoGainControl': true,
-      },
-      'video': {
-        'facingMode': 'user',
-        'width': {'ideal': 1280},
-        'height': {'ideal': 720},
-      },
-    }
+            'audio': {
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': true,
+            },
+            'video': {
+              'facingMode': 'user',
+              'width': {'ideal': 1280},
+              'height': {'ideal': 720},
+            },
+          }
         : {
-      'audio': {
-        'echoCancellation': true,
-        'noiseSuppression': true,
-        'autoGainControl': true,
-      },
-      'video': false,
-    };
+            'audio': {
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': true,
+            },
+            'video': false,
+          };
     return navigator.mediaDevices.getUserMedia(constraints);
   }
 
@@ -274,6 +298,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
     };
 
     pc.onConnectionState = (state) {
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        Helper.setSpeakerphoneOn(_isSpeakerOn).catchError((_) {});
+      }
       if ([
         RTCPeerConnectionState.RTCPeerConnectionStateDisconnected,
         RTCPeerConnectionState.RTCPeerConnectionStateFailed,
@@ -282,6 +309,19 @@ class _GroupCallScreenState extends State<GroupCallScreen>
         _closePeerConnection(peerId);
       }
     };
+
+    // ── Data channel: offerer creates it ─────────────────────────
+    try {
+      final dcInit = RTCDataChannelInit()..ordered = true;
+      final dc = await pc.createDataChannel('state', dcInit);
+      _dataChannels[peerId] = dc;
+      dc.onDataChannelState = (s) {
+        if (s == RTCDataChannelState.RTCDataChannelOpen) {
+          _sendStateTo(dc);
+        }
+      };
+      dc.onMessage = (msg) => _handlePeerStateMessage(peerId, msg);
+    } catch (_) {}
 
     return pc;
   }
@@ -300,15 +340,35 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   }
 
   Future<void> _handleOffer(
-      int fromUserId, Map<String, dynamic> offerMap, String callType) async {
+    int fromUserId,
+    Map<String, dynamic> offerMap,
+    String callType,
+  ) async {
     final pc = await _createPC(fromUserId);
+
+    // Answerer side: receive the data channel the offerer created
+    pc.onDataChannel = (dc) {
+      _dataChannels[fromUserId] = dc;
+      dc.onDataChannelState = (s) {
+        if (s == RTCDataChannelState.RTCDataChannelOpen) {
+          _sendStateTo(dc);
+        }
+      };
+      dc.onMessage = (msg) => _handlePeerStateMessage(fromUserId, msg);
+    };
+
     _localStream?.getTracks().forEach((t) => pc.addTrack(t, _localStream!));
     await pc.setRemoteDescription(
-      RTCSessionDescription(offerMap['sdp'] as String, offerMap['type'] as String),
+      RTCSessionDescription(
+        offerMap['sdp'] as String,
+        offerMap['type'] as String,
+      ),
     );
     // Flush pending candidates
     final pending = _pendingCandidates.remove(fromUserId) ?? [];
-    for (final c in pending) await pc.addCandidate(c);
+    for (final c in pending) {
+      await pc.addCandidate(c);
+    }
 
     final answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -320,18 +380,30 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   }
 
   Future<void> _handleAnswer(
-      int fromUserId, Map<String, dynamic> answerMap) async {
+    int fromUserId,
+    Map<String, dynamic> answerMap,
+  ) async {
     final pc = _pcs[fromUserId];
     if (pc == null) return;
-    if (pc.signalingState != RTCSignalingState.RTCSignalingStateHaveLocalOffer) return;
+    if (pc.signalingState !=
+        RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+      return;
+    }
     await pc.setRemoteDescription(
-      RTCSessionDescription(answerMap['sdp'] as String, answerMap['type'] as String),
+      RTCSessionDescription(
+        answerMap['sdp'] as String,
+        answerMap['type'] as String,
+      ),
     );
     final pending = _pendingCandidates.remove(fromUserId) ?? [];
-    for (final c in pending) await pc.addCandidate(c);
+    for (final c in pending) {
+      await pc.addCandidate(c);
+    }
   }
 
   void _closePeerConnection(int peerId) {
+    _dataChannels[peerId]?.close();
+    _dataChannels.remove(peerId);
     _pcs[peerId]?.close();
     _pcs.remove(peerId);
     _remoteStreams.remove(peerId);
@@ -339,17 +411,31 @@ class _GroupCallScreenState extends State<GroupCallScreen>
     _remoteRenderers[peerId]?.dispose();
     _remoteRenderers.remove(peerId);
     _pendingCandidates.remove(peerId);
+    _peerIsMuted.remove(peerId);
+    _peerIsVideoOff.remove(peerId);
+    _participantNames.remove(peerId);
     if (mounted) setState(() {});
   }
 
   void _cleanupAll() {
+    if (_cleanedUp) return;
+    _cleanedUp = true;
     _timer?.cancel();
     _localStream?.getTracks().forEach((t) => t.stop());
     _localStream?.dispose();
     _localStream = null;
-    for (final peerId in List.from(_pcs.keys)) {
-      _closePeerConnection(peerId);
+    for (final dc in _dataChannels.values) {
+      dc.close();
     }
+    _dataChannels.clear();
+    for (final peerId in List.from(_pcs.keys)) {
+      _pcs[peerId]?.close();
+      _remoteRenderers[peerId]?.srcObject = null;
+      _remoteRenderers[peerId]?.dispose();
+    }
+    _pcs.clear();
+    _remoteStreams.clear();
+    _remoteRenderers.clear();
     _localRenderer.srcObject = null;
     _localRenderer.dispose();
   }
@@ -369,11 +455,94 @@ class _GroupCallScreenState extends State<GroupCallScreen>
 
   void _hangup() {
     if (_state == GroupCallState.ended) return;
-    NotificationService().endAllCalls();
+    if (widget.isInitiator) {
+      _showEndCallDialog();
+    } else {
+      _doHangup(endForAll: false);
+    }
+  }
 
-    // If I'm the last one or initiator ending — end for everyone
-    // Otherwise just leave
-    if (widget.isInitiator && _pcs.isEmpty) {
+  Future<void> _showEndCallDialog() async {
+    final choice = await showDialog<String>(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E1E2E),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: const BoxDecoration(
+                  color: Color(0x33E53935),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.call_end_rounded, color: Color(0xFFE53935), size: 28),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'End Call',
+                style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Do you want to leave or end the call for everyone?',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+              const SizedBox(height: 24),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(context, 'leave'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white70,
+                        side: const BorderSide(color: Colors.white24),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      child: const Text('Leave'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(context, 'end_all'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFE53935),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      child: const Text('End for All'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    _doHangup(endForAll: choice == 'end_all');
+  }
+
+  void _doHangup({required bool endForAll}) {
+    if (_state == GroupCallState.ended) return;
+    NotificationService().endAllCalls();
+    SocketIndex.notifyCallEnded();
+
+    if (endForAll) {
       SocketEvents.emitGroupCallEnd(
         conversationId: widget.conversationId,
         userId: widget.myUserId,
@@ -396,6 +565,7 @@ class _GroupCallScreenState extends State<GroupCallScreen>
   void _handleCallEnded() {
     if (_state == GroupCallState.ended) return;
     NotificationService().endAllCalls();
+    SocketIndex.notifyCallEnded();
     _cleanupAll();
     if (!mounted) return;
     setState(() => _state = GroupCallState.ended);
@@ -404,19 +574,52 @@ class _GroupCallScreenState extends State<GroupCallScreen>
     });
   }
 
+  void _sendStateTo(RTCDataChannel dc) {
+    try {
+      final payload = jsonEncode({'muted': _isMuted, 'videoOff': _isVideoOff});
+      dc.send(RTCDataChannelMessage(payload));
+    } catch (_) {}
+  }
+
+  void _broadcastState() {
+    for (final dc in _dataChannels.values) {
+      if (dc.state == RTCDataChannelState.RTCDataChannelOpen) {
+        _sendStateTo(dc);
+      }
+    }
+  }
+
+  void _handlePeerStateMessage(int peerId, RTCDataChannelMessage msg) {
+    try {
+      final map = jsonDecode(msg.text) as Map<String, dynamic>;
+      final muted = map['muted'] as bool? ?? false;
+      final videoOff = map['videoOff'] as bool? ?? false;
+      if (mounted) {
+        setState(() {
+          _peerIsMuted[peerId] = muted;
+          _peerIsVideoOff[peerId] = videoOff;
+        });
+      }
+    } catch (_) {}
+  }
+
   void _toggleMute() {
     _localStream?.getAudioTracks().forEach((t) => t.enabled = !t.enabled);
     setState(() => _isMuted = !_isMuted);
+    _broadcastState();
   }
 
-  void _toggleSpeaker() {
+  Future<void> _toggleSpeaker() async {
     setState(() => _isSpeakerOn = !_isSpeakerOn);
-    Helper.setSpeakerphoneOn(_isSpeakerOn);
+    try {
+      await Helper.setSpeakerphoneOn(_isSpeakerOn);
+    } catch (_) {}
   }
 
   void _toggleVideo() {
     _localStream?.getVideoTracks().forEach((t) => t.enabled = !t.enabled);
     setState(() => _isVideoOff = !_isVideoOff);
+    _broadcastState();
   }
 
   Future<void> _switchCamera() async {
@@ -437,9 +640,14 @@ class _GroupCallScreenState extends State<GroupCallScreen>
 
   Color _avatarColor(String name) {
     const colors = [
-      Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFEF5350),
-      Color(0xFFAB47BC), Color(0xFF42A5F5), Color(0xFFFF7043),
-      Color(0xFF66BB6A), Color(0xFFEC407A),
+      Color(0xFF5C6BC0),
+      Color(0xFF26A69A),
+      Color(0xFFEF5350),
+      Color(0xFFAB47BC),
+      Color(0xFF42A5F5),
+      Color(0xFFFF7043),
+      Color(0xFF66BB6A),
+      Color(0xFFEC407A),
     ];
     return colors[name.length % colors.length];
   }
@@ -473,7 +681,11 @@ class _GroupCallScreenState extends State<GroupCallScreen>
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
-                colors: [Color(0xFF0D0D1A), Color(0xFF1A0D2E), Color(0xFF0D1A1A)],
+                colors: [
+                  Color(0xFF0D0D1A),
+                  Color(0xFF1A0D2E),
+                  Color(0xFF0D1A1A),
+                ],
               ),
             ),
           ),
@@ -512,12 +724,13 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: GridView.builder(
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 3,
-                      mainAxisSpacing: 16,
-                      crossAxisSpacing: 16,
-                      childAspectRatio: 0.85,
-                    ),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          mainAxisSpacing: 16,
+                          crossAxisSpacing: 16,
+                          childAspectRatio: 0.85,
+                        ),
                     itemCount: totalInCall,
                     itemBuilder: (_, i) {
                       // First tile = me
@@ -532,7 +745,7 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                       return _buildParticipantTile(
                         name: entry.value,
                         isMe: false,
-                        isMuted: false,
+                        isMuted: _peerIsMuted[entry.key] ?? false,
                       );
                     },
                   ),
@@ -549,7 +762,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         _RoundBtn(
-                          icon: _isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
+                          icon: _isMuted
+                              ? Icons.mic_off_rounded
+                              : Icons.mic_rounded,
                           label: _isMuted ? 'Unmute' : 'Mute',
                           active: !_isMuted,
                           onTap: _toggleMute,
@@ -597,8 +812,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                 shape: BoxShape.circle,
                 boxShadow: [
                   BoxShadow(
-                    color: (isMe ? const Color(0xFF7C3AED) : color)
-                        .withOpacity(0.4),
+                    color: (isMe ? const Color(0xFF7C3AED) : color).withOpacity(
+                      0.4,
+                    ),
                     blurRadius: 12,
                   ),
                 ],
@@ -622,7 +838,11 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                   color: Color(0xFFE53935),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.mic_off_rounded, size: 12, color: Colors.white),
+                child: const Icon(
+                  Icons.mic_off_rounded,
+                  size: 12,
+                  color: Colors.white,
+                ),
               ),
           ],
         ),
@@ -655,7 +875,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
 
         // Top bar
         Positioned(
-          top: 0, left: 0, right: 0,
+          top: 0,
+          left: 0,
+          right: 0,
           child: SafeArea(
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -671,7 +893,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                             color: Colors.white,
                             fontSize: 16,
                             fontWeight: FontWeight.w700,
-                            shadows: [Shadow(blurRadius: 8, color: Colors.black54)],
+                            shadows: [
+                              Shadow(blurRadius: 8, color: Colors.black54),
+                            ],
                           ),
                         ),
                         Text(
@@ -689,7 +913,10 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                     ),
                   ),
                   if (_isVideo)
-                    _GlassBtn(icon: Icons.flip_camera_ios_rounded, onTap: _switchCamera),
+                    _GlassBtn(
+                      icon: Icons.flip_camera_ios_rounded,
+                      onTap: _switchCamera,
+                    ),
                 ],
               ),
             ),
@@ -698,13 +925,18 @@ class _GroupCallScreenState extends State<GroupCallScreen>
 
         // Bottom controls
         Positioned(
-          bottom: 0, left: 0, right: 0,
+          bottom: 0,
+          left: 0,
+          right: 0,
           child: SafeArea(
             top: false,
             child: Padding(
               padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.45),
                   borderRadius: BorderRadius.circular(24),
@@ -714,7 +946,9 @@ class _GroupCallScreenState extends State<GroupCallScreen>
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
                     _PillBtn(
-                      icon: _isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
+                      icon: _isMuted
+                          ? Icons.mic_off_rounded
+                          : Icons.mic_rounded,
                       label: _isMuted ? 'Unmute' : 'Mute',
                       active: !_isMuted,
                       onTap: _toggleMute,
@@ -752,11 +986,17 @@ class _GroupCallScreenState extends State<GroupCallScreen>
     if (total == 1) {
       // Only me — local fullscreen
       return Positioned.fill(
-        child: _isVideoOff
-            ? _buildBlackAvatar('You')
-            : RTCVideoView(_localRenderer,
-            mirror: _isFrontCamera,
-            objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+        child: _buildVideoTile(
+          video: _isVideoOff
+              ? _buildBlackAvatar('You')
+              : RTCVideoView(
+                  _localRenderer,
+                  mirror: _isFrontCamera,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                ),
+          name: 'You',
+          isMuted: _isMuted,
+        ),
       );
     }
 
@@ -765,30 +1005,64 @@ class _GroupCallScreenState extends State<GroupCallScreen>
       final peer = peerIds[0];
       final renderer = _remoteRenderers[peer];
       final name = _participantNames[peer] ?? 'User';
+      final peerMuted = _peerIsMuted[peer] ?? false;
       return Stack(
         children: [
+          // Peer fullscreen with name + mute badge
           Positioned.fill(
-            child: renderer != null && _remoteStreams[peer] != null
-                ? RTCVideoView(renderer,
-                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
-                : _buildBlackAvatar(name),
+            child: _buildVideoTile(
+              video: renderer != null &&
+                      _remoteStreams[peer] != null &&
+                      _peerIsVideoOff[peer] != true
+                  ? RTCVideoView(
+                      renderer,
+                      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                    )
+                  : _buildBlackAvatar(name),
+              name: name,
+              isMuted: peerMuted,
+            ),
           ),
+          // Local PiP with mute badge
           Positioned(
-            right: 16, bottom: 120,
-            child: Container(
-              width: 96, height: 128,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.white.withOpacity(0.3)),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: _isVideoOff
-                    ? _buildBlackAvatar('You')
-                    : RTCVideoView(_localRenderer,
-                    mirror: _isFrontCamera,
-                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
-              ),
+            right: 16,
+            bottom: 120,
+            child: Stack(
+              children: [
+                Container(
+                  width: 96,
+                  height: 128,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white.withOpacity(0.3)),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: _isVideoOff
+                        ? _buildBlackAvatar('You')
+                        : RTCVideoView(
+                            _localRenderer,
+                            mirror: _isFrontCamera,
+                            objectFit:
+                                RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                          ),
+                  ),
+                ),
+                if (_isMuted)
+                  Positioned(
+                    bottom: 6,
+                    right: 6,
+                    child: Container(
+                      width: 22,
+                      height: 22,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFFE53935),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.mic_off_rounded, size: 13, color: Colors.white),
+                    ),
+                  ),
+              ],
             ),
           ),
         ],
@@ -806,21 +1080,72 @@ class _GroupCallScreenState extends State<GroupCallScreen>
       itemCount: total,
       itemBuilder: (_, i) {
         if (i == 0) {
-          // Me
-          return _isVideoOff
-              ? _buildBlackAvatar('You')
-              : RTCVideoView(_localRenderer,
-              mirror: _isFrontCamera,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover);
+          return _buildVideoTile(
+            video: _isVideoOff
+                ? _buildBlackAvatar('You')
+                : RTCVideoView(
+                    _localRenderer,
+                    mirror: _isFrontCamera,
+                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                  ),
+            name: 'You',
+            isMuted: _isMuted,
+          );
         }
         final peer = peerIds[i - 1];
         final renderer = _remoteRenderers[peer];
         final name = _participantNames[peer] ?? 'User';
-        return renderer != null && _remoteStreams[peer] != null
-            ? RTCVideoView(renderer,
-            objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
-            : _buildBlackAvatar(name);
+        final peerMuted = _peerIsMuted[peer] ?? false;
+        return _buildVideoTile(
+          video: renderer != null &&
+                  _remoteStreams[peer] != null &&
+                  _peerIsVideoOff[peer] != true
+              ? RTCVideoView(
+                  renderer,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                )
+              : _buildBlackAvatar(name),
+          name: name,
+          isMuted: peerMuted,
+        );
       },
+    );
+  }
+
+  /// Wraps any video widget with a bottom-left name + mute badge overlay.
+  Widget _buildVideoTile({
+    required Widget video,
+    required String name,
+    required bool isMuted,
+  }) {
+    return Stack(
+      children: [
+        Positioned.fill(child: video),
+        Positioned(
+          bottom: 8,
+          left: 8,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.55),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isMuted) ...[
+                  const Icon(Icons.mic_off_rounded, size: 13, color: Color(0xFFE53935)),
+                  const SizedBox(width: 4),
+                ],
+                Text(
+                  name,
+                  style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -832,7 +1157,8 @@ class _GroupCallScreenState extends State<GroupCallScreen>
           mainAxisSize: MainAxisSize.min,
           children: [
             Container(
-              width: 64, height: 64,
+              width: 64,
+              height: 64,
               decoration: BoxDecoration(
                 color: _avatarColor(name),
                 shape: BoxShape.circle,
@@ -867,7 +1193,12 @@ class _RoundBtn extends StatelessWidget {
   final String label;
   final bool active;
   final VoidCallback onTap;
-  const _RoundBtn({required this.icon, required this.label, required this.onTap, this.active = true});
+  const _RoundBtn({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.active = true,
+  });
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -877,16 +1208,34 @@ class _RoundBtn extends StatelessWidget {
         children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            width: 60, height: 60,
+            width: 60,
+            height: 60,
             decoration: BoxDecoration(
-              color: active ? Colors.white.withOpacity(0.15) : Colors.white.withOpacity(0.06),
+              color: active
+                  ? Colors.white.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.06),
               shape: BoxShape.circle,
-              border: Border.all(color: active ? Colors.white.withOpacity(0.3) : Colors.white.withOpacity(0.1)),
+              border: Border.all(
+                color: active
+                    ? Colors.white.withOpacity(0.3)
+                    : Colors.white.withOpacity(0.1),
+              ),
             ),
-            child: Icon(icon, color: active ? Colors.white : Colors.white38, size: 24),
+            child: Icon(
+              icon,
+              color: active ? Colors.white : Colors.white38,
+              size: 24,
+            ),
           ),
           const SizedBox(height: 8),
-          Text(label, style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 11, fontWeight: FontWeight.w500)),
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.7),
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
         ],
       ),
     );
@@ -898,7 +1247,12 @@ class _PillBtn extends StatelessWidget {
   final String label;
   final bool active;
   final VoidCallback onTap;
-  const _PillBtn({required this.icon, required this.label, required this.onTap, this.active = true});
+  const _PillBtn({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.active = true,
+  });
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -908,16 +1262,34 @@ class _PillBtn extends StatelessWidget {
         children: [
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
-            width: 52, height: 52,
+            width: 52,
+            height: 52,
             decoration: BoxDecoration(
-              color: active ? Colors.white.withOpacity(0.15) : Colors.white.withOpacity(0.06),
+              color: active
+                  ? Colors.white.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.06),
               shape: BoxShape.circle,
-              border: Border.all(color: active ? Colors.white.withOpacity(0.25) : Colors.white.withOpacity(0.1)),
+              border: Border.all(
+                color: active
+                    ? Colors.white.withOpacity(0.25)
+                    : Colors.white.withOpacity(0.1),
+              ),
             ),
-            child: Icon(icon, color: active ? Colors.white : Colors.white38, size: 22),
+            child: Icon(
+              icon,
+              color: active ? Colors.white : Colors.white38,
+              size: 22,
+            ),
           ),
           const SizedBox(height: 6),
-          Text(label, style: TextStyle(color: active ? Colors.white.withOpacity(0.85) : Colors.white38, fontSize: 10, fontWeight: FontWeight.w500)),
+          Text(
+            label,
+            style: TextStyle(
+              color: active ? Colors.white.withOpacity(0.85) : Colors.white38,
+              fontSize: 10,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
         ],
       ),
     );
@@ -926,8 +1298,7 @@ class _PillBtn extends StatelessWidget {
 
 class _EndBtn extends StatelessWidget {
   final VoidCallback onTap;
-  final String label;
-  const _EndBtn({required this.onTap, this.label = 'End call'});
+  const _EndBtn({required this.onTap});
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -936,16 +1307,34 @@ class _EndBtn extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 52, height: 52,
+            width: 52,
+            height: 52,
             decoration: const BoxDecoration(
               color: Color(0xFFE53935),
               shape: BoxShape.circle,
-              boxShadow: [BoxShadow(color: Color(0x66E53935), blurRadius: 20, spreadRadius: 2)],
+              boxShadow: [
+                BoxShadow(
+                  color: Color(0x66E53935),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                ),
+              ],
             ),
-            child: const Icon(Icons.call_end_rounded, color: Colors.white, size: 28),
+            child: const Icon(
+              Icons.call_end_rounded,
+              color: Colors.white,
+              size: 28,
+            ),
           ),
           const SizedBox(height: 8),
-          Text(label, style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 11, fontWeight: FontWeight.w500)),
+          Text(
+            'End',
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.7),
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
         ],
       ),
     );
@@ -961,7 +1350,8 @@ class _GlassBtn extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 44, height: 44,
+        width: 44,
+        height: 44,
         decoration: BoxDecoration(
           color: Colors.white.withOpacity(0.12),
           borderRadius: BorderRadius.circular(12),

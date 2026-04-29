@@ -1,17 +1,24 @@
 import 'dart:io';
 
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:kore_chat/screens/splash/splash_screen.dart';
+import 'package:kore_chat/services/debug_logger.dart';
+import 'package:kore_chat/services/firebase_messaging_service.dart';
 import 'package:kore_chat/services/navigation_service.dart';
 import 'package:kore_chat/services/notification_service.dart';
 import 'package:provider/provider.dart';
-
 import 'theme/app_theme.dart';
 import 'theme/theme_provider.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Register background/killed-state FCM handler BEFORE Firebase.initializeApp
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+
+  await DebugLogger.log('Main', 'app started platform=${Platform.operatingSystem}');
 
   if (Platform.isIOS) {
     await Firebase.initializeApp(
@@ -63,5 +70,3 @@ class KoreChatApp extends StatelessWidget {
     );
   }
 }
-
-// latest updated code

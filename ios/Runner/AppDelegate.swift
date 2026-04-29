@@ -10,6 +10,8 @@ import CallKit
 @objc class AppDelegate: FlutterAppDelegate, PKPushRegistryDelegate, CXCallObserverDelegate {
 
     private let callObserver = CXCallObserver()
+    // MUST be a strong property — if local, ARC deallocates it and VoIP push stops working
+    private var voipRegistry: PKPushRegistry!
 
     override func application(
         _ application: UIApplication,
@@ -21,8 +23,8 @@ import CallKit
         // Observe CallKit for audio session handoff
         callObserver.setDelegate(self, queue: .main)
 
-        // Register VoIP push
-        let voipRegistry = PKPushRegistry(queue: DispatchQueue.main)
+        // Register VoIP push — stored as strong property so it survives this function
+        voipRegistry = PKPushRegistry(queue: DispatchQueue.main)
         voipRegistry.delegate = self
         voipRegistry.desiredPushTypes = [PKPushType.voIP]
 
@@ -83,8 +85,13 @@ import CallKit
                       didUpdate pushCredentials: PKPushCredentials,
                       for type: PKPushType) {
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
-        print("📱 VoIP token: \(token)")
+        print("📱 VoIP token registered: \(token)")
         SwiftFlutterCallkitIncomingPlugin.sharedInstance?.setDevicePushTokenVoIP(token)
+    }
+
+    func pushRegistry(_ registry: PKPushRegistry,
+                      didInvalidatePushTokenFor type: PKPushType) {
+        print("⚠️ VoIP token invalidated — will re-register on next launch")
     }
 
     // ── PushKit: incoming VoIP call ───────────────────────────────
@@ -95,29 +102,40 @@ import CallKit
                       completion: @escaping () -> Void) {
 
         let p = payload.dictionaryPayload
-        print("📦 VoIP payload keys: \(p.keys)")
+        print("📦 VoIP payload: \(p)")
 
-        guard
-            let callerName  = p["callerName"]  as? String,
-            let callType    = p["callType"]    as? String,
-            let callerIdStr = p["callerId"]    as? String
-        else {
-            print("⚠️ Missing required VoIP payload fields")
+        // callerName is always required
+        guard let callerName = p["callerName"] as? String, !callerName.isEmpty else {
+            print("⚠️ VoIP: missing callerName — cannot show CallKit")
             completion()
             return
         }
 
-        // ← Backend sends 'offer' key — read both to be safe
+        // callType: backend may send "callType" string OR "hasVideo" bool
+        let callType: String
+        if let ct = p["callType"] as? String, !ct.isEmpty {
+            callType = ct
+        } else if let hv = p["hasVideo"] as? Bool {
+            callType = hv ? "video" : "audio"
+        } else {
+            callType = "audio"
+        }
+
+        // callerId: backend may send "callerId" (user id) or "callId" (room id)
+        let callerIdStr = (p["callerId"] as? String)
+            ?? (p["callId"]   as? String)
+            ?? "0"
+
+        // offer: backend must include "offerJson" or "offer"
         let offerJson = (p["offerJson"] as? String)
-            ?? (p["offer"] as? String)
+            ?? (p["offer"]    as? String)
             ?? ""
 
-        print("📞 VoIP call from \(callerName), offerJson empty: \(offerJson.isEmpty)")
+        print("📞 VoIP: caller=\(callerName) type=\(callType) id=\(callerIdStr) offerEmpty=\(offerJson.isEmpty)")
 
         let uuid = UUID().uuidString
         let isVideo = callType == "video"
 
-        // Activate audio before showing CallKit (required by Apple)
         activateAudio()
 
         let callData = flutter_callkit_incoming.Data(
@@ -132,7 +150,8 @@ import CallKit
             "callerId":   callerIdStr,
             "callerName": callerName,
             "callType":   callType,
-            "offerJson":  offerJson,  // ← store as offerJson for Flutter to read
+            "offerJson":  offerJson,
+            "callTimestamp": String(Int(Date().timeIntervalSince1970 * 1000)),
         ]
         callData.iconName                              = "AppIcon"
         callData.handleType                            = "generic"
@@ -153,10 +172,5 @@ import CallKit
             .showCallkitIncoming(callData, fromPushKit: true)
 
         completion()
-    }
-
-    func pushRegistry(_ registry: PKPushRegistry,
-                      didInvalidatePushTokenFor type: PKPushType) {
-        print("⚠️ VoIP token invalidated")
     }
 }
